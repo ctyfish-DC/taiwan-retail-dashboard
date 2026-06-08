@@ -33,6 +33,18 @@ HEADERS = {
 # MOEA 經濟部統計處 — Retail Sales (Overall only)
 # ─────────────────────────────────────────────
 
+def _make_moea_session() -> requests.Session:
+    """Establish a session on MOEA main page to bypass WAF."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.headers["Referer"] = "https://www.moea.gov.tw/"
+    try:
+        session.get("https://www.moea.gov.tw/", timeout=15)
+    except Exception:
+        pass
+    return session
+
+
 def fetch_moea_retail() -> dict:
     result = {"overall": None, "error": None}
 
@@ -133,14 +145,13 @@ def _moea_via_datagov_direct() -> Optional[pd.DataFrame]:
 
 
 def _moea_via_hub() -> Optional[pd.DataFrame]:
-    """Scrape MOEA statistics pages for retail data."""
+    """Scrape MOEA statistics pages for retail data, with session warmup."""
     urls_to_try = [
         "https://www.moea.gov.tw/Mns/dos/content/wHandMenuFile.ashx?mid=9861",
         "https://www.moea.gov.tw/Mns/dos/content/Content.aspx?menu_id=9861",
         "https://www.moea.gov.tw/Mns/dos/home/IndexLink.aspx?mid=9861",
     ]
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = _make_moea_session()
 
     for hub_url in urls_to_try:
         try:
@@ -291,9 +302,14 @@ def _cpi_via_imf() -> dict:
     if not values:
         raise ValueError("No IMF PCPIPCH data for TWN")
 
-    # values = {"2023": 2.49, "2024": 2.16, ...}
-    latest_year = max(values.keys(), key=lambda y: int(y))
-    yoy = round(float(values[latest_year]), 2)
+    # Filter out future forecasts — only use confirmed historical years
+    current_year = datetime.now().year
+    historical = {y: v for y, v in values.items() if int(y) < current_year and v is not None}
+    if not historical:
+        raise ValueError("No historical IMF data for TWN")
+
+    latest_year = max(historical.keys(), key=lambda y: int(y))
+    yoy = round(float(historical[latest_year]), 2)
 
     return {
         "month": f"{latest_year}年（年均）",
@@ -339,7 +355,11 @@ def fetch_mops_baodao() -> dict:
     }
 
     try:
-        url = "https://mops.twse.com.tw/mops/web/ajax_t05st09_1"
+        # Establish MOPS session first (required for AJAX endpoints to return tables)
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        session.get("https://mops.twse.com.tw/mops/web/index", timeout=15)
+
         # 上市(sii) 用 t05st09_1，上櫃(otc) 用 t05st10_1
         endpoints = {
             "otc": "https://mops.twse.com.tw/mops/web/ajax_t05st10_1",
@@ -354,7 +374,8 @@ def fetch_mops_baodao() -> dict:
                 "co_id": "2107",
                 "TYPEK": typek,
             }
-            resp = requests.post(url, data=payload, headers=HEADERS, timeout=30)
+            session.headers["Referer"] = url.replace("ajax_", "")
+            resp = session.post(url, data=payload, timeout=30)
             resp.encoding = "utf-8"
             soup = BeautifulSoup(resp.text, "html.parser")
 
