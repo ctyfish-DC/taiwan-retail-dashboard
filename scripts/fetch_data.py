@@ -46,7 +46,7 @@ def fetch_moea_retail() -> dict:
                     logger.info("MOEA fetched via %s", attempt.__name__)
                     return result
         except Exception as exc:
-            logger.debug("MOEA %s failed: %s", attempt.__name__, exc)
+            logger.warning("MOEA %s failed: %s", attempt.__name__, exc)
 
     result["error"] = "MOEA 資料暫時無法取得"
     logger.warning("All MOEA fetch attempts failed")
@@ -195,91 +195,55 @@ def _guess_latest_month(df: pd.DataFrame) -> str:
 
 def fetch_cpi() -> dict:
     """
-    Fetch Taiwan CPI from OECD Stats API — no IP restrictions.
-    Falls back to World Bank API if OECD is unavailable.
+    Fetch Taiwan CPI from IMF DataMapper API — globally accessible, includes Taiwan.
+    Falls back to World Bank API.
     """
     result = {"month": None, "cpi": None, "yoy_pct": None, "error": None}
 
-    for attempt in (_cpi_via_oecd, _cpi_via_worldbank):
+    for attempt in (_cpi_via_imf, _cpi_via_worldbank):
         try:
             parsed = attempt()
-            if parsed.get("cpi") is not None or parsed.get("yoy_pct") is not None:
+            if parsed.get("yoy_pct") is not None or parsed.get("cpi") is not None:
                 result.update(parsed)
                 logger.info("CPI fetched via %s", attempt.__name__)
                 return result
         except Exception as exc:
-            logger.debug("CPI %s failed: %s", attempt.__name__, exc)
+            logger.warning("CPI %s failed: %s", attempt.__name__, exc)
 
     result["error"] = "CPI 資料暫時無法取得"
     logger.warning("All CPI fetch attempts failed")
     return result
 
 
-def _cpi_via_oecd() -> dict:
+def _cpi_via_imf() -> dict:
     """
-    OECD SDMX-JSON API for Taiwan monthly CPI index (base=2015).
-    Endpoint: PRICES_CPI / TWN.CPALTT01.IXOB.M
+    IMF DataMapper API — PCPIPCH = CPI annual % change for Taiwan (TWN).
+    Returns latest available annual YoY inflation rate.
+    Free, no auth, globally accessible.
     """
-    now = datetime.now()
-    start = f"{now.year - 2}-01"
-    url = (
-        "https://stats.oecd.org/SDMX-JSON/data/"
-        f"PRICES_CPI/TWN.CPALTT01.IXOB.M/all"
-        f"?startTime={start}&format=json"
-    )
-    resp = requests.get(url, timeout=30)
+    url = "https://www.imf.org/external/datamapper/api/v1/PCPIPCH/TWN"
+    resp = requests.get(url, timeout=20)
     resp.raise_for_status()
     data = resp.json()
 
-    # Navigate SDMX-JSON structure
-    dataset = data.get("dataSets", [{}])[0]
-    series = dataset.get("series", {})
-    if not series:
-        raise ValueError("No series in OECD response")
+    values = data.get("values", {}).get("PCPIPCH", {}).get("TWN", {})
+    if not values:
+        raise ValueError("No IMF PCPIPCH data for TWN")
 
-    # Get the first (only) series
-    obs = next(iter(series.values())).get("observations", {})
-    if not obs:
-        raise ValueError("No observations in OECD series")
+    # values = {"2023": 2.49, "2024": 2.16, ...}
+    latest_year = max(values.keys(), key=lambda y: int(y))
+    yoy = round(float(values[latest_year]), 2)
 
-    # Get time dimension
-    structure = data.get("structure", {})
-    dims = structure.get("dimensions", {}).get("observation", [])
-    time_dim = next((d for d in dims if d.get("id") == "TIME_PERIOD"), None)
-    if not time_dim:
-        raise ValueError("No TIME_PERIOD dimension")
-
-    time_values = [v.get("id") for v in time_dim.get("values", [])]
-
-    # Build sorted list of (time, value)
-    obs_list = []
-    for idx_str, val_list in obs.items():
-        idx = int(idx_str)
-        if idx < len(time_values) and val_list and val_list[0] is not None:
-            obs_list.append((time_values[idx], float(val_list[0])))
-
-    obs_list.sort(key=lambda x: x[0])
-    if not obs_list:
-        raise ValueError("Empty observation list")
-
-    latest_time, latest_cpi = obs_list[-1]
-    # YoY: 12 months ago
-    yoy = None
-    if len(obs_list) >= 13:
-        prev_time, prev_cpi = obs_list[-13]
-        yoy = round((latest_cpi - prev_cpi) / prev_cpi * 100, 2)
-
-    # Parse "2026-04" → "2026年4月"
-    m = re.match(r"(\d{4})-(\d{2})", latest_time)
-    month_label = f"{m.group(1)}年{int(m.group(2))}月" if m else latest_time
-
-    return {"month": month_label, "cpi": round(latest_cpi, 2), "yoy_pct": yoy}
+    return {
+        "month": f"{latest_year}年（年均）",
+        "cpi": None,
+        "yoy_pct": yoy,
+    }
 
 
 def _cpi_via_worldbank() -> dict:
     """
-    World Bank API for Taiwan CPI annual % change (fallback).
-    Indicator FP.CPI.TOTL.ZG = CPI inflation, annual %.
+    World Bank API — FP.CPI.TOTL.ZG = CPI annual % change for Taiwan (TW).
     """
     url = (
         "https://api.worldbank.org/v2/country/TW/indicator/FP.CPI.TOTL.ZG"
@@ -315,29 +279,34 @@ def fetch_mops_baodao() -> dict:
 
     try:
         url = "https://mops.twse.com.tw/mops/web/ajax_t05st09_1"
-        payload = {
-            "encodeURIComponent": "1",
-            "step": "1",
-            "firstin": "1",
-            "off": "1",
-            "co_id": "2107",
-            "TYPEK": "sii",
-        }
-        resp = requests.post(url, data=payload, headers=HEADERS, timeout=30)
-        resp.encoding = "utf-8"
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # Try both 上市 (sii) and 上櫃 (otc) — 寶島眼鏡 is listed on OTC
+        for typek in ("otc", "sii"):
+            payload = {
+                "encodeURIComponent": "1",
+                "step": "1",
+                "firstin": "1",
+                "off": "1",
+                "co_id": "2107",
+                "TYPEK": typek,
+            }
+            resp = requests.post(url, data=payload, headers=HEADERS, timeout=30)
+            resp.encoding = "utf-8"
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-        for table in soup.find_all("table"):
-            for row in table.find_all("tr"):
-                cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-                if len(cells) >= 2 and re.search(r"\d{3}[年/]\d{1,2}月", cells[0]):
-                    try:
-                        revenue_k = float(cells[1].replace(",", ""))
-                        result["period"] = cells[0]
-                        result["revenue_100m"] = round(revenue_k / 100_000, 2)
-                    except (ValueError, IndexError):
-                        pass
-                    break
+            for table in soup.find_all("table"):
+                for row in table.find_all("tr"):
+                    cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                    if len(cells) >= 2 and re.search(r"\d{3}[年/]\d{1,2}月", cells[0]):
+                        try:
+                            revenue_k = float(cells[1].replace(",", ""))
+                            result["period"] = cells[0]
+                            result["revenue_100m"] = round(revenue_k / 100_000, 2)
+                        except (ValueError, IndexError):
+                            pass
+                        break
+            if result["period"]:
+                logger.info("MOPS fetched with TYPEK=%s", typek)
+                break
 
         if result["period"]:
             _enrich_quarterly(result)
