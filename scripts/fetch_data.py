@@ -36,7 +36,7 @@ HEADERS = {
 def fetch_moea_retail() -> dict:
     result = {"overall": None, "error": None}
 
-    for attempt in (_moea_via_dmz, _moea_via_hub, _moea_via_datagov):
+    for attempt in (_moea_via_datagov_search, _moea_via_datagov_direct, _moea_via_hub):
         try:
             df = attempt()
             if df is not None and not df.empty:
@@ -45,6 +45,8 @@ def fetch_moea_retail() -> dict:
                     result["overall"] = parsed
                     logger.info("MOEA fetched via %s", attempt.__name__)
                     return result
+                else:
+                    logger.warning("MOEA %s: DataFrame found but parse failed", attempt.__name__)
         except Exception as exc:
             logger.warning("MOEA %s failed: %s", attempt.__name__, exc)
 
@@ -53,98 +55,120 @@ def fetch_moea_retail() -> dict:
     return result
 
 
-def _moea_via_dmz() -> Optional[pd.DataFrame]:
-    """POST to MOEA DMZ statistics interface."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
+def _moea_via_datagov_search() -> Optional[pd.DataFrame]:
+    """
+    Search data.gov.tw open data for 批發零售業 dataset and download CSV/Excel.
+    data.gov.tw is accessible from GitHub Actions (returns HTTP errors, not connection refused).
+    """
+    # Try multiple search terms
+    for keyword in ("批發零售", "零售業營業額", "零售"):
+        try:
+            url = f"https://data.gov.tw/api/v2/datasets?keyword={requests.utils.quote(keyword)}&size=10"
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            logger.warning("data.gov.tw search status: %d for keyword=%s", resp.status_code, keyword)
+            if resp.status_code != 200:
+                continue
+            body = resp.json()
+            # Handle both possible response structures
+            datasets = (
+                body.get("result", {}).get("results")
+                or body.get("results")
+                or []
+            )
+            for ds in datasets:
+                for res in ds.get("resources", []):
+                    dl_url = res.get("download_url", "") or res.get("url", "")
+                    if not dl_url:
+                        continue
+                    ext = dl_url.lower().split("?")[0].split(".")[-1]
+                    if ext not in ("csv", "xlsx", "xls"):
+                        continue
+                    try:
+                        r = requests.get(dl_url, headers=HEADERS, timeout=60)
+                        r.raise_for_status()
+                        if ext == "csv":
+                            df = _read_csv_bytes(r.content)
+                        else:
+                            df = pd.read_excel(io.BytesIO(r.content), header=None)
+                        if df is not None and not df.empty:
+                            logger.warning("data.gov.tw: got df from %s", dl_url)
+                            return df
+                    except Exception as exc:
+                        logger.warning("data.gov.tw download %s failed: %s", dl_url, exc)
+        except Exception as exc:
+            logger.warning("data.gov.tw search keyword=%s failed: %s", keyword, exc)
+    raise ValueError("No usable dataset from data.gov.tw search")
 
-    url = "https://dmz26.moea.gov.tw/GMWeb/investigate/InvestigateDA.aspx"
-    resp = session.get(url, timeout=30)
+
+def _moea_via_datagov_direct() -> Optional[pd.DataFrame]:
+    """
+    Try direct known data.gov.tw dataset resource URLs for MOEA retail stats.
+    Dataset IDs that have historically contained this data.
+    """
+    # These are candidate dataset IDs — try fetching their metadata to get download URLs
+    candidate_ids = ["6889", "25803", "10396"]
+    for dataset_id in candidate_ids:
+        try:
+            meta_url = f"https://data.gov.tw/api/v2/datasets/{dataset_id}"
+            resp = requests.get(meta_url, headers=HEADERS, timeout=15)
+            logger.warning("data.gov.tw dataset %s: HTTP %d", dataset_id, resp.status_code)
+            if resp.status_code != 200:
+                continue
+            resources = resp.json().get("result", {}).get("resources", [])
+            for res in resources:
+                dl_url = res.get("download_url", "")
+                if not dl_url:
+                    continue
+                ext = dl_url.lower().split("?")[0].split(".")[-1]
+                if ext not in ("csv", "xlsx", "xls"):
+                    continue
+                r = requests.get(dl_url, headers=HEADERS, timeout=60)
+                r.raise_for_status()
+                df = _read_csv_bytes(r.content) if ext == "csv" else pd.read_excel(io.BytesIO(r.content), header=None)
+                if df is not None and not df.empty:
+                    return df
+        except Exception as exc:
+            logger.warning("data.gov.tw dataset %s failed: %s", dataset_id, exc)
+    raise ValueError("No usable direct dataset from data.gov.tw")
+
+
+def _moea_via_hub() -> Optional[pd.DataFrame]:
+    """Scrape MOEA statistics hub page for Excel download link."""
+    hub_url = "https://www.moea.gov.tw/Mns/dos/content/wHandMenuFile.ashx?mid=9861"
+    resp = requests.get(hub_url, headers=HEADERS, timeout=30)
+    logger.warning("MOEA hub HTTP %d, content-length=%d", resp.status_code, len(resp.content))
     resp.raise_for_status()
     resp.encoding = "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    viewstate = soup.find("input", {"id": "__VIEWSTATE"})
-    eventval = soup.find("input", {"id": "__EVENTVALIDATION"})
-
-    payload = {
-        "__VIEWSTATE": viewstate["value"] if viewstate else "",
-        "__EVENTVALIDATION": eventval["value"] if eventval else "",
-        "ctl00$ContentPlaceHolder1$btnQuery": "查詢",
-    }
-    resp2 = session.post(url, data=payload, timeout=30)
-    resp2.encoding = "utf-8"
-
-    tables = pd.read_html(resp2.text)
-    for df in tables:
-        if "零售" in df.to_string():
-            return df
-    raise ValueError("No retail table in MOEA DMZ response")
-
-
-def _moea_via_hub() -> Optional[pd.DataFrame]:
-    """Scrape MOEA hub page for Excel download link."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    hub_url = "https://www.moea.gov.tw/Mns/dos/content/wHandMenuFile.ashx?mid=9861"
-    resp = session.get(hub_url, timeout=30)
-    resp.encoding = "utf-8"
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    for a in soup.find_all("a", href=True):
+    links = soup.find_all("a", href=True)
+    logger.warning("MOEA hub: found %d links", len(links))
+    for a in links:
         href = a["href"]
         if not href.startswith("http"):
             href = "https://www.moea.gov.tw" + href
         if href.endswith((".xlsx", ".xls")):
-            r = session.get(href, timeout=60)
+            r = requests.get(href, headers=HEADERS, timeout=60)
             r.raise_for_status()
             df = pd.read_excel(io.BytesIO(r.content), header=None)
-            if "零售" in df.to_string():
+            if df is not None and "零售" in df.to_string():
                 return df
         elif href.endswith(".csv"):
-            r = session.get(href, timeout=60)
+            r = requests.get(href, headers=HEADERS, timeout=60)
             r.raise_for_status()
-            for enc in ("utf-8-sig", "big5", "cp950"):
-                try:
-                    df = pd.read_csv(io.StringIO(r.content.decode(enc)))
-                    if not df.empty:
-                        return df
-                except Exception:
-                    continue
-    raise ValueError("No Excel/CSV on MOEA hub page")
+            df = _read_csv_bytes(r.content)
+            if df is not None and not df.empty:
+                return df
+    raise ValueError(f"No Excel/CSV links found on MOEA hub (found {len(links)} total links)")
 
 
-def _moea_via_datagov() -> Optional[pd.DataFrame]:
-    """Try data.gov.tw keyword search."""
-    search_url = "https://data.gov.tw/api/v2/datasets?keyword=零售業營業額&size=5&_format=json"
-    resp = requests.get(search_url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    body = resp.json()
-    results = body.get("result", {}).get("results", body.get("results", []))
-    for ds in results:
-        for res in ds.get("resources", []):
-            url = res.get("download_url", "")
-            if not url:
-                continue
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=60)
-                r.raise_for_status()
-                if url.lower().endswith((".xlsx", ".xls")):
-                    df = pd.read_excel(io.BytesIO(r.content), header=None)
-                    if "零售" in df.to_string():
-                        return df
-                elif url.lower().endswith(".csv"):
-                    for enc in ("utf-8-sig", "big5", "cp950"):
-                        try:
-                            df = pd.read_csv(io.StringIO(r.content.decode(enc)))
-                            if not df.empty:
-                                return df
-                        except Exception:
-                            continue
-            except Exception as exc:
-                logger.debug("data.gov.tw resource %s failed: %s", url, exc)
-    raise ValueError("No usable retail dataset from data.gov.tw")
+def _read_csv_bytes(content: bytes) -> Optional[pd.DataFrame]:
+    for enc in ("utf-8-sig", "big5", "cp950", "utf-8"):
+        try:
+            return pd.read_csv(io.StringIO(content.decode(enc)))
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+    return None
 
 
 def _parse_moea_overall(df: pd.DataFrame) -> Optional[dict]:
