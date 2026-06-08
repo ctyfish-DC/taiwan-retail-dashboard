@@ -133,33 +133,70 @@ def _moea_via_datagov_direct() -> Optional[pd.DataFrame]:
 
 
 def _moea_via_hub() -> Optional[pd.DataFrame]:
-    """Scrape MOEA statistics hub page for Excel download link."""
-    hub_url = "https://www.moea.gov.tw/Mns/dos/content/wHandMenuFile.ashx?mid=9861"
-    resp = requests.get(hub_url, headers=HEADERS, timeout=30)
-    logger.warning("MOEA hub HTTP %d, content-length=%d", resp.status_code, len(resp.content))
-    resp.raise_for_status()
-    resp.encoding = "utf-8"
-    soup = BeautifulSoup(resp.text, "html.parser")
+    """Scrape MOEA statistics pages for retail data."""
+    urls_to_try = [
+        "https://www.moea.gov.tw/Mns/dos/content/wHandMenuFile.ashx?mid=9861",
+        "https://www.moea.gov.tw/Mns/dos/content/Content.aspx?menu_id=9861",
+        "https://www.moea.gov.tw/Mns/dos/home/IndexLink.aspx?mid=9861",
+    ]
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    links = soup.find_all("a", href=True)
-    logger.warning("MOEA hub: found %d links", len(links))
-    for a in links:
-        href = a["href"]
-        if not href.startswith("http"):
-            href = "https://www.moea.gov.tw" + href
-        if href.endswith((".xlsx", ".xls")):
-            r = requests.get(href, headers=HEADERS, timeout=60)
-            r.raise_for_status()
-            df = pd.read_excel(io.BytesIO(r.content), header=None)
-            if df is not None and "零售" in df.to_string():
-                return df
-        elif href.endswith(".csv"):
-            r = requests.get(href, headers=HEADERS, timeout=60)
-            r.raise_for_status()
-            df = _read_csv_bytes(r.content)
-            if df is not None and not df.empty:
-                return df
-    raise ValueError(f"No Excel/CSV links found on MOEA hub (found {len(links)} total links)")
+    for hub_url in urls_to_try:
+        try:
+            resp = session.get(hub_url, timeout=30, allow_redirects=True)
+            logger.warning("MOEA hub %s → HTTP %d, %d bytes", hub_url, resp.status_code, len(resp.content))
+            if resp.status_code != 200:
+                continue
+            resp.encoding = "utf-8"
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            links = soup.find_all("a", href=True)
+            logger.warning("MOEA hub: found %d links, first 3: %s",
+                           len(links),
+                           [a["href"] for a in links[:3]])
+
+            for a in links:
+                href = a["href"]
+                if not href.startswith("http"):
+                    href = "https://www.moea.gov.tw" + href
+                # Follow any link to find Excel/CSV
+                if href.endswith((".xlsx", ".xls")):
+                    r = session.get(href, timeout=60)
+                    r.raise_for_status()
+                    df = pd.read_excel(io.BytesIO(r.content), header=None)
+                    if df is not None and not df.empty:
+                        logger.warning("MOEA: downloaded Excel from %s", href)
+                        return df
+                elif href.endswith(".csv"):
+                    r = session.get(href, timeout=60)
+                    r.raise_for_status()
+                    df = _read_csv_bytes(r.content)
+                    if df is not None and not df.empty:
+                        return df
+                elif "dos" in href and any(kw in a.get_text() for kw in ("零售", "批發", "統計", "下載")):
+                    # Follow internal links that might lead to data
+                    try:
+                        r = session.get(href, timeout=20)
+                        r.encoding = "utf-8"
+                        sub = BeautifulSoup(r.text, "html.parser")
+                        for sub_a in sub.find_all("a", href=True):
+                            sub_href = sub_a["href"]
+                            if not sub_href.startswith("http"):
+                                sub_href = "https://www.moea.gov.tw" + sub_href
+                            if sub_href.endswith((".xlsx", ".xls")):
+                                r2 = session.get(sub_href, timeout=60)
+                                r2.raise_for_status()
+                                df = pd.read_excel(io.BytesIO(r2.content), header=None)
+                                if df is not None and not df.empty:
+                                    logger.warning("MOEA: found Excel via sub-link %s", sub_href)
+                                    return df
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("MOEA hub %s failed: %s", hub_url, exc)
+
+    raise ValueError("No Excel/CSV found on any MOEA hub page")
 
 
 def _read_csv_bytes(content: bytes) -> Optional[pd.DataFrame]:
@@ -303,8 +340,12 @@ def fetch_mops_baodao() -> dict:
 
     try:
         url = "https://mops.twse.com.tw/mops/web/ajax_t05st09_1"
-        # Try both 上市 (sii) and 上櫃 (otc)
-        for typek in ("otc", "sii"):
+        # 上市(sii) 用 t05st09_1，上櫃(otc) 用 t05st10_1
+        endpoints = {
+            "otc": "https://mops.twse.com.tw/mops/web/ajax_t05st10_1",
+            "sii": "https://mops.twse.com.tw/mops/web/ajax_t05st09_1",
+        }
+        for typek, url in endpoints.items():
             payload = {
                 "encodeURIComponent": "1",
                 "step": "1",

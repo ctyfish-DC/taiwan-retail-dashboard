@@ -58,6 +58,9 @@ def build_message(data: dict) -> str:
         lines.append(f"最新月份: {cpi.get('month', 'N/A')}")
         lines.append(f"CPI: {cpi['cpi']:.2f}")
         lines.append(f"YoY: {_fmt_pct(cpi.get('yoy_pct'))}")
+    elif cpi.get("yoy_pct") is not None:
+        lines.append(f"參考期間: {cpi.get('month', 'N/A')}")
+        lines.append(f"通膨率 YoY: {_fmt_pct(cpi.get('yoy_pct'))}")
     else:
         lines.append("⚠️ 暫時無法取得")
     lines.append("")
