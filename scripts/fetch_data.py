@@ -303,7 +303,7 @@ def fetch_mops_baodao() -> dict:
 
     try:
         url = "https://mops.twse.com.tw/mops/web/ajax_t05st09_1"
-        # Try both 上市 (sii) and 上櫃 (otc) — 寶島眼鏡 is listed on OTC
+        # Try both 上市 (sii) and 上櫃 (otc)
         for typek in ("otc", "sii"):
             payload = {
                 "encodeURIComponent": "1",
@@ -317,10 +317,28 @@ def fetch_mops_baodao() -> dict:
             resp.encoding = "utf-8"
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            for table in soup.find_all("table"):
+            tables = soup.find_all("table")
+            logger.warning("MOPS typek=%s: HTTP %d, tables=%d", typek, resp.status_code, len(tables))
+
+            for ti, table in enumerate(tables):
+                rows = table.find_all("tr")
+                for row in rows[:5]:  # Log first 5 rows for debugging
+                    cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                    if cells:
+                        logger.warning("MOPS table[%d] row sample: %s", ti, cells[:4])
+                        break
+
+            for table in tables:
                 for row in table.find_all("tr"):
                     cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-                    if len(cells) >= 2 and re.search(r"\d{3}[年/]\d{1,2}月", cells[0]):
+                    if not cells:
+                        continue
+                    # Match ROC date patterns: "115年1月", "115/01", "11501"
+                    date_match = (
+                        re.search(r"\d{3}[年/]\d{1,2}", cells[0])
+                        or (len(cells[0]) == 5 and cells[0].isdigit())
+                    )
+                    if len(cells) >= 2 and date_match:
                         try:
                             revenue_k = float(cells[1].replace(",", ""))
                             result["period"] = cells[0]
@@ -329,7 +347,7 @@ def fetch_mops_baodao() -> dict:
                             pass
                         break
             if result["period"]:
-                logger.info("MOPS fetched with TYPEK=%s", typek)
+                logger.info("MOPS fetched with TYPEK=%s, period=%s", typek, result["period"])
                 break
 
         if result["period"]:
