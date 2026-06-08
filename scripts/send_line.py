@@ -39,7 +39,6 @@ def build_message(data: dict) -> str:
     # MOEA 整體零售業
     moea = data.get("moea", {})
     overall = moea.get("overall")
-    eyewear = moea.get("eyewear")
     moea_error = moea.get("error")
 
     lines.append("【整體零售業】")
@@ -48,15 +47,6 @@ def build_message(data: dict) -> str:
         lines.append(f"月營業額: {_fmt_100m(overall.get('revenue_100m'))}")
         lines.append(f"YoY: {_fmt_pct(overall.get('yoy_pct'))}")
         lines.append(f"MoM: {_fmt_pct(overall.get('mom_pct'))}")
-    else:
-        lines.append(f"⚠️ 暫時無法取得")
-    lines.append("")
-
-    lines.append("【眼鏡行類別】")
-    if eyewear:
-        lines.append(f"最新月份: {eyewear.get('month', 'N/A')}")
-        lines.append(f"月營業額: {_fmt_100m(eyewear.get('revenue_100m'))}")
-        lines.append(f"YoY: {_fmt_pct(eyewear.get('yoy_pct'))}")
     else:
         lines.append("⚠️ 暫時無法取得")
     lines.append("")
@@ -78,7 +68,7 @@ def build_message(data: dict) -> str:
     if mops.get("period"):
         lines.append(f"期別: {mops['period']}")
         if mops.get("revenue_100m") is not None:
-            lines.append(f"營收: {_fmt_100m(mops.get('revenue_100m'))}")
+            lines.append(f"月營收: {_fmt_100m(mops.get('revenue_100m'))}")
         if mops.get("net_income_100m") is not None:
             lines.append(f"稅後淨利: {_fmt_100m(mops.get('net_income_100m'))}")
     else:
