@@ -1,0 +1,31 @@
+name: Taiwan Retail Weekly LINE Notify
+
+on:
+  schedule:
+    # Every Monday at 00:00 UTC = Monday 08:00 Taiwan time (UTC+8)
+    - cron: "0 0 * * 1"
+  workflow_dispatch:  # Allow manual trigger for testing
+
+jobs:
+  notify:
+    name: Fetch data and send LINE Notify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run weekly notify
+        env:
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+        run: python scripts/main.py
+        working-directory: ${{ github.workspace }}
