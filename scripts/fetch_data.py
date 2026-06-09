@@ -343,17 +343,13 @@ def _cpi_via_worldbank() -> dict:
 
 
 # ─────────────────────────────────────────────
-# MOPS 公開資訊觀測站 — 寶島光學科技 (5312)
+# MOPS 公開資訊觀測站 — 寶島眼鏡 (2107)
 # ─────────────────────────────────────────────
-
-BAODAO_CO_ID = "5312"
-BAODAO_TYPEK = "otc"  # 上櫃
 
 def fetch_mops_baodao() -> dict:
     result = {
         "period": None,
         "revenue_100m": None,
-        "gross_margin_pct": None,
         "net_income_100m": None,
         "error": None,
     }
@@ -364,62 +360,69 @@ def fetch_mops_baodao() -> dict:
         session.headers.update(HEADERS)
         session.get("https://mops.twse.com.tw/mops/web/index", timeout=15)
 
-        # 上櫃(otc) 用 ajax_t05st10_1
-        url = "https://mops.twse.com.tw/mops/web/ajax_t05st10_1"
-        session.headers["Referer"] = "https://mops.twse.com.tw/mops/web/t05st10_1"
-        payload = {
-            "encodeURIComponent": "1",
-            "step": "1",
-            "firstin": "1",
-            "off": "1",
-            "co_id": BAODAO_CO_ID,
-            "TYPEK": BAODAO_TYPEK,
+        # 上市(sii) 用 t05st09_1，上櫃(otc) 用 t05st10_1
+        endpoints = {
+            "otc": "https://mops.twse.com.tw/mops/web/ajax_t05st10_1",
+            "sii": "https://mops.twse.com.tw/mops/web/ajax_t05st09_1",
         }
-        resp = session.post(url, data=payload, timeout=30)
-        resp.encoding = "utf-8"
-        soup = BeautifulSoup(resp.text, "html.parser")
+        for typek, url in endpoints.items():
+            payload = {
+                "encodeURIComponent": "1",
+                "step": "1",
+                "firstin": "1",
+                "off": "1",
+                "co_id": "2107",
+                "TYPEK": typek,
+            }
+            session.headers["Referer"] = url.replace("ajax_", "")
+            resp = session.post(url, data=payload, timeout=30)
+            resp.encoding = "utf-8"
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-        tables = soup.find_all("table")
-        logger.warning("MOPS 5312 otc: HTTP %d, tables=%d", resp.status_code, len(tables))
+            tables = soup.find_all("table")
+            logger.warning("MOPS typek=%s: HTTP %d, tables=%d", typek, resp.status_code, len(tables))
 
-        for ti, table in enumerate(tables):
-            rows = table.find_all("tr")
-            for row in rows[:5]:
-                cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-                if cells:
-                    logger.warning("MOPS table[%d] row sample: %s", ti, cells[:4])
-                    break
+            for ti, table in enumerate(tables):
+                rows = table.find_all("tr")
+                for row in rows[:5]:  # Log first 5 rows for debugging
+                    cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                    if cells:
+                        logger.warning("MOPS table[%d] row sample: %s", ti, cells[:4])
+                        break
 
-        for table in tables:
-            for row in table.find_all("tr"):
-                cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-                if not cells:
-                    continue
-                date_match = (
-                    re.search(r"\d{3}[年/]\d{1,2}", cells[0])
-                    or (len(cells[0]) == 5 and cells[0].isdigit())
-                )
-                if len(cells) >= 2 and date_match:
-                    try:
-                        revenue_k = float(cells[1].replace(",", ""))
-                        result["period"] = cells[0]
-                        result["revenue_100m"] = round(revenue_k / 100_000, 2)
-                    except (ValueError, IndexError):
-                        pass
-                    break
+            for table in tables:
+                for row in table.find_all("tr"):
+                    cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                    if not cells:
+                        continue
+                    # Match ROC date patterns: "115年1月", "115/01", "11501"
+                    date_match = (
+                        re.search(r"\d{3}[年/]\d{1,2}", cells[0])
+                        or (len(cells[0]) == 5 and cells[0].isdigit())
+                    )
+                    if len(cells) >= 2 and date_match:
+                        try:
+                            revenue_k = float(cells[1].replace(",", ""))
+                            result["period"] = cells[0]
+                            result["revenue_100m"] = round(revenue_k / 100_000, 2)
+                        except (ValueError, IndexError):
+                            pass
+                        break
+            if result["period"]:
+                logger.info("MOPS fetched with TYPEK=%s, period=%s", typek, result["period"])
+                break
 
         if result["period"]:
-            logger.info("MOPS fetched: period=%s", result["period"])
-            _enrich_quarterly(result, session)
+            _enrich_quarterly(result)
 
     except Exception as exc:
         logger.warning("MOPS fetch failed: %s", exc)
-        result["error"] = f"寶島光學財報暫時無法取得: {exc}"
+        result["error"] = f"寶島眼鏡財報暫時無法取得: {exc}"
 
     return result
 
 
-def _enrich_quarterly(result: dict, session: Optional[requests.Session] = None) -> None:
+def _enrich_quarterly(result: dict) -> None:
     try:
         now = datetime.now()
         roc_year = now.year - 1911
@@ -434,13 +437,12 @@ def _enrich_quarterly(result: dict, session: Optional[requests.Session] = None) 
             "step": "1",
             "firstin": "1",
             "off": "1",
-            "co_id": BAODAO_CO_ID,
+            "co_id": "2107",
             "year": str(roc_year),
             "season": str(quarter).zfill(2),
-            "TYPEK": BAODAO_TYPEK,
+            "TYPEK": "sii",
         }
-        requester = session if session else requests
-        resp = requester.post(url, data=payload, headers=HEADERS, timeout=30)
+        resp = requests.post(url, data=payload, headers=HEADERS, timeout=30)
         resp.encoding = "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -472,7 +474,7 @@ def fetch_all() -> dict:
     logger.info("Fetching CPI data (OECD API)…")
     cpi = fetch_cpi()
 
-    logger.info("Fetching MOPS 寶島光學科技 (5312) data…")
+    logger.info("Fetching MOPS 寶島眼鏡 data…")
     mops = fetch_mops_baodao()
 
     return {

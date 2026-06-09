@@ -1,14 +1,17 @@
 name: Taiwan Retail Weekly LINE Notify
 
 on:
-  schedule:
-    # Every Monday at 00:00 UTC = Monday 08:00 Taiwan time (UTC+8)
-    - cron: "0 0 * * 1"
-  workflow_dispatch:  # Allow manual trigger for testing
+  # Schedule paused — will re-enable after Synology self-hosted runner is set up
+  # schedule:
+  #   - cron: "0 0 * * 1"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   notify:
-    name: Fetch data and send LINE Notify
+    name: Fetch data and send LINE message
     runs-on: ubuntu-latest
 
     steps:
@@ -27,5 +30,6 @@ jobs:
       - name: Run weekly notify
         env:
           LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
         run: python scripts/main.py
         working-directory: ${{ github.workspace }}
