@@ -65,13 +65,15 @@ def build_message(data: dict) -> str:
         lines.append("⚠️ 暫時無法取得")
     lines.append("")
 
-    # MOPS 寶島眼鏡
+    # MOPS 寶島光學科技 (5312)
     mops = data.get("mops", {})
-    lines.append("【寶島眼鏡 (2107) 最新財報】")
+    lines.append("【寶島光學科技 (5312) 最新財報】")
     if mops.get("period"):
         lines.append(f"期別: {mops['period']}")
         if mops.get("revenue_100m") is not None:
             lines.append(f"月營收: {_fmt_100m(mops.get('revenue_100m'))}")
+        if mops.get("gross_margin_pct") is not None:
+            lines.append(f"毛利率: {mops['gross_margin_pct']:.1f}%")
         if mops.get("net_income_100m") is not None:
             lines.append(f"稅後淨利: {_fmt_100m(mops.get('net_income_100m'))}")
     else:
