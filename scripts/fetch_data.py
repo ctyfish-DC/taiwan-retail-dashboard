@@ -364,98 +364,111 @@ def _guess_current_month() -> str:
 
 
 # ─────────────────────────────────────────────
-# MOPS 公開資訊觀測站 — 寶島眼鏡 (2107)
+# MOPS 公開資訊觀測站 — 寶島光學科技 (5312, 上櫃)
 # ─────────────────────────────────────────────
+
+BAODAO_CO_ID = "5312"
+BAODAO_TYPEK = "otc"  # 上櫃
 
 def fetch_mops_baodao() -> dict:
     """
-    Fetch the latest financial report for 寶島眼鏡 (stock code 2107)
+    Fetch monthly revenue + quarterly financials for 寶島光學科技 (5312, OTC)
     from 公開資訊觀測站 MOPS.
 
     Returns:
-        {period, revenue_100m, gross_profit_100m, net_income_100m, error}
+        {period, revenue_100m, net_income_100m, gross_margin_pct, error}
     """
     result = {
         "period": None,
         "revenue_100m": None,
-        "gross_profit_100m": None,
         "net_income_100m": None,
+        "gross_margin_pct": None,
         "error": None,
     }
 
     try:
-        # MOPS monthly revenue report (t05st09_1)
-        url = "https://mops.twse.com.tw/mops/web/ajax_t05st09_1"
+        # Establish MOPS session (AJAX endpoints require a prior session cookie)
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        session.get("https://mops.twse.com.tw/mops/web/index", timeout=15)
+
+        # Monthly revenue — OTC companies use t05st10_1
+        url = "https://mops.twse.com.tw/mops/web/ajax_t05st10_1"
+        session.headers["Referer"] = "https://mops.twse.com.tw/mops/web/t05st10_1"
         payload = {
             "encodeURIComponent": "1",
             "step": "1",
             "firstin": "1",
             "off": "1",
-            "co_id": "2107",
-            "TYPEK": "sii",
+            "co_id": BAODAO_CO_ID,
+            "TYPEK": BAODAO_TYPEK,
         }
-        resp = requests.post(url, data=payload, headers=HEADERS, timeout=30)
+        resp = session.post(url, data=payload, timeout=30)
         resp.encoding = "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        tables = soup.find_all("table")
-        for table in tables:
-            rows = table.find_all("tr")
-            if len(rows) < 2:
-                continue
-            # Find header row and data rows
-            for i, row in enumerate(rows):
+        logger.warning("MOPS monthly: HTTP %d, tables=%d", resp.status_code, len(soup.find_all("table")))
+
+        for table in soup.find_all("table"):
+            for row in table.find_all("tr"):
                 cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-                if len(cells) >= 3 and re.search(r"\d{3}[年/]\d{1,2}月", cells[0]):
-                    # cells[0] = period (e.g. 113年1月), cells[2] = cumulative revenue
-                    period = cells[0]
+                if not cells:
+                    continue
+                # Date patterns: "115年1月", "115/01", or 5-digit "11501"
+                if len(cells) >= 2 and (
+                    re.search(r"\d{3}[年/]\d{1,2}", cells[0])
+                    or (len(cells[0]) == 5 and cells[0].isdigit())
+                ):
                     try:
-                        revenue_k = float(cells[1].replace(",", ""))  # in thousands
-                        result["period"] = period
+                        revenue_k = float(cells[1].replace(",", ""))
+                        result["period"] = cells[0]
                         result["revenue_100m"] = round(revenue_k / 100_000, 2)
                     except (ValueError, IndexError):
                         pass
                     break
 
-        # If we got monthly revenue, try quarterly financial statements
-        _enrich_quarterly(result)
+        # Quarterly financials
+        _enrich_quarterly(result, session)
 
     except Exception as exc:
         logger.warning("MOPS fetch failed: %s", exc)
-        result["error"] = f"寶島眼鏡財報暫時無法取得: {exc}"
+        result["error"] = f"寶島光學財報暫時無法取得: {exc}"
 
     return result
 
 
-def _enrich_quarterly(result: dict) -> None:
-    """
-    Try to fetch the latest quarterly income statement from MOPS
-    and add gross profit / net income.
-    """
+def _enrich_quarterly(result: dict, session: requests.Session = None) -> None:
+    """Fetch latest quarterly income statement for gross margin and net income."""
     try:
-        url = "https://mops.twse.com.tw/mops/web/ajax_t163sb04"
-        # Determine latest available quarter
         now = datetime.now()
-        # ROC year
         roc_year = now.year - 1911
-        quarter = (now.month - 1) // 3  # 0-based; latest *published* quarter
+        # Latest published quarter (financial reports lag ~45 days)
+        quarter = (now.month - 1) // 3
         if quarter == 0:
             quarter = 4
             roc_year -= 1
 
+        if session is None:
+            session = requests.Session()
+            session.headers.update(HEADERS)
+
+        url = "https://mops.twse.com.tw/mops/web/ajax_t163sb04"
+        session.headers["Referer"] = "https://mops.twse.com.tw/mops/web/t163sb04"
         payload = {
             "encodeURIComponent": "1",
             "step": "1",
             "firstin": "1",
             "off": "1",
-            "co_id": "2107",
+            "co_id": BAODAO_CO_ID,
             "year": str(roc_year),
             "season": str(quarter).zfill(2),
-            "TYPEK": "sii",
+            "TYPEK": BAODAO_TYPEK,
         }
-        resp = requests.post(url, data=payload, headers=HEADERS, timeout=30)
+        resp = session.post(url, data=payload, timeout=30)
         resp.encoding = "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
+
+        logger.warning("MOPS quarterly: HTTP %d, tables=%d", resp.status_code, len(soup.find_all("table")))
 
         tables = soup.find_all("table")
         for table in tables:
@@ -480,16 +493,22 @@ def _enrich_quarterly(result: dict) -> None:
                         except ValueError:
                             continue
                 if "營業毛利" in " ".join(cells):
+                    rev = result.get("revenue_100m")
                     for cell in cells:
                         try:
                             val = float(cell.replace(",", ""))
-                            result["gross_profit_100m"] = round(val / 100_000, 2)
+                            gross = round(val / 100_000, 2)
+                            # Calculate gross margin % if we have revenue
+                            if rev and rev > 0:
+                                result["gross_margin_pct"] = round(gross / rev * 100, 1)
                             break
                         except ValueError:
                             continue
+                if result.get("net_income_100m") is not None:
+                    result["period"] = f"{roc_year + 1911}Q{quarter}"
 
     except Exception as exc:
-        logger.debug("Quarterly enrichment failed (non-critical): %s", exc)
+        logger.warning("Quarterly enrichment failed: %s", exc)
 
 
 # ─────────────────────────────────────────────
@@ -507,7 +526,7 @@ def fetch_all() -> dict:
     logger.info("Fetching CPI data…")
     cpi = fetch_cpi()
 
-    logger.info("Fetching MOPS 寶島眼鏡 data…")
+    logger.info("Fetching MOPS 寶島光學科技 (5312) data…")
     mops = fetch_mops_baodao()
 
     return {

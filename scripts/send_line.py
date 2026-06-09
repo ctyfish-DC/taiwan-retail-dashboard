@@ -92,18 +92,17 @@ def build_message(data: dict) -> str:
         lines.append("⚠️ CPI 資料暫時無法取得")
     lines.append("")
 
-    # ── MOPS 寶島眼鏡 (2107) ──────────────────────
+    # ── MOPS 寶島光學科技 (5312) ──────────────────
     mops = data.get("mops", {})
-    lines.append("【寶島眼鏡 (2107) 最新財報】")
+    lines.append("【寶島光學科技 (5312) 最新財報】")
     if mops.get("error") and mops.get("period") is None:
         lines.append("暫無新財報")
-        lines.append(f"  ({mops['error']})")
     elif mops.get("period"):
         lines.append(f"期別: {mops['period']}")
         if mops.get("revenue_100m") is not None:
-            lines.append(f"營收: {_fmt_100m(mops.get('revenue_100m'))}")
-        if mops.get("gross_profit_100m") is not None:
-            lines.append(f"毛利: {_fmt_100m(mops.get('gross_profit_100m'))}")
+            lines.append(f"月營收: {_fmt_100m(mops.get('revenue_100m'))}")
+        if mops.get("gross_margin_pct") is not None:
+            lines.append(f"毛利率: {mops['gross_margin_pct']:.1f}%")
         if mops.get("net_income_100m") is not None:
             lines.append(f"稅後淨利: {_fmt_100m(mops.get('net_income_100m'))}")
     else:
