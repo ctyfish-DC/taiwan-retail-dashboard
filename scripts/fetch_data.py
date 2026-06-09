@@ -1,8 +1,8 @@
 """
 fetch_data.py
 Fetches Taiwan retail statistics from:
-  - MOEA 經濟部統計處: Overall retail monthly revenue (YoY/MoM) and 眼鏡行 category
-  - DGBAS 主計總處: CPI data
+  - MOEA 經濟部統計處: Overall retail monthly revenue (YoY/MoM)
+  - OECD API: Taiwan CPI (globally accessible, no IP restrictions)
   - MOPS 公開資訊觀測站: 寶島眼鏡 (2107) latest financial report
 """
 
@@ -22,377 +22,349 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.moea.gov.tw/",
 }
 
 # ─────────────────────────────────────────────
-# MOEA 經濟部統計處 — Retail Sales
+# MOEA 經濟部統計處 — Retail Sales (Overall only)
 # ─────────────────────────────────────────────
 
-def fetch_moea_retail() -> dict:
-    """
-    Fetch overall retail and 眼鏡行 monthly revenue from MOEA open data.
-
-    Returns a dict with keys:
-        overall: {month, revenue_100m, yoy_pct, mom_pct}
-        eyewear: {month, revenue_100m, yoy_pct}
-        error: str | None
-    """
-    result = {
-        "overall": None,
-        "eyewear": None,
-        "error": None,
-    }
-
-    # The 批發、零售及餐飲業 statistics page lists downloadable Excel files.
-    # We try the government open-data CSV endpoint first, then fall back to
-    # scraping the MOEA statistics hub for the latest Excel/CSV link.
+def _make_moea_session() -> requests.Session:
+    """Establish a session on MOEA main page to bypass WAF."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.headers["Referer"] = "https://www.moea.gov.tw/"
     try:
-        # ── Approach 1: data.gov.tw open data (dataset 6889) ──────────────
-        # The dataset provides a JSON resource list; we grab the CSV download URL.
-        api_url = (
-            "https://data.gov.tw/api/v2/datasets/6889"
-            "?format=json&_format=json"
-        )
-        resp = requests.get(api_url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        resources = resp.json().get("result", {}).get("resources", [])
-        csv_url = None
-        for r in resources:
-            url = r.get("download_url", "")
-            if url.lower().endswith(".csv"):
-                csv_url = url
-                break
+        session.get("https://www.moea.gov.tw/", timeout=15)
+    except Exception:
+        pass
+    return session
 
-        if csv_url:
-            df = _download_moea_csv(csv_url)
-        else:
-            df = _scrape_moea_excel()
 
-        if df is not None and not df.empty:
-            result["overall"] = _parse_moea_overall(df)
-            result["eyewear"] = _parse_moea_eyewear(df)
-        else:
-            raise ValueError("MOEA dataframe is empty after download")
+def fetch_moea_retail() -> dict:
+    result = {"overall": None, "error": None}
 
-    except Exception as exc:
-        logger.warning("MOEA retail fetch failed: %s", exc)
-        # ── Fallback: direct scrape of statistics hub page ────────────────
+    for attempt in (_moea_via_datagov_search, _moea_via_datagov_direct, _moea_via_hub):
         try:
-            df = _scrape_moea_excel()
+            df = attempt()
             if df is not None and not df.empty:
-                result["overall"] = _parse_moea_overall(df)
-                result["eyewear"] = _parse_moea_eyewear(df)
-            else:
-                result["error"] = f"MOEA data unavailable: {exc}"
-        except Exception as exc2:
-            result["error"] = f"MOEA data unavailable: {exc2}"
+                parsed = _parse_moea_overall(df)
+                if parsed is not None:
+                    result["overall"] = parsed
+                    logger.info("MOEA fetched via %s", attempt.__name__)
+                    return result
+                else:
+                    logger.warning("MOEA %s: DataFrame found but parse failed", attempt.__name__)
+        except Exception as exc:
+            logger.warning("MOEA %s failed: %s", attempt.__name__, exc)
 
+    result["error"] = "MOEA 資料暫時無法取得"
+    logger.warning("All MOEA fetch attempts failed")
     return result
 
 
-def _download_moea_csv(url: str) -> Optional[pd.DataFrame]:
-    resp = requests.get(url, headers=HEADERS, timeout=60)
-    resp.raise_for_status()
-    # Try UTF-8-SIG (BOM) first, then big5
-    for enc in ("utf-8-sig", "big5", "cp950"):
+def _moea_via_datagov_search() -> Optional[pd.DataFrame]:
+    """
+    Search data.gov.tw open data for 批發零售業 dataset and download CSV/Excel.
+    data.gov.tw is accessible from GitHub Actions (returns HTTP errors, not connection refused).
+    """
+    # Try multiple search terms
+    for keyword in ("批發零售", "零售業營業額", "零售"):
         try:
-            return pd.read_csv(io.StringIO(resp.content.decode(enc)))
+            url = f"https://data.gov.tw/api/v2/datasets?keyword={requests.utils.quote(keyword)}&size=10"
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            logger.warning("data.gov.tw search status: %d for keyword=%s", resp.status_code, keyword)
+            if resp.status_code != 200:
+                continue
+            body = resp.json()
+            # Handle both possible response structures
+            datasets = (
+                body.get("result", {}).get("results")
+                or body.get("results")
+                or []
+            )
+            for ds in datasets:
+                for res in ds.get("resources", []):
+                    dl_url = res.get("download_url", "") or res.get("url", "")
+                    if not dl_url:
+                        continue
+                    ext = dl_url.lower().split("?")[0].split(".")[-1]
+                    if ext not in ("csv", "xlsx", "xls"):
+                        continue
+                    try:
+                        r = requests.get(dl_url, headers=HEADERS, timeout=60)
+                        r.raise_for_status()
+                        if ext == "csv":
+                            df = _read_csv_bytes(r.content)
+                        else:
+                            df = pd.read_excel(io.BytesIO(r.content), header=None)
+                        if df is not None and not df.empty:
+                            logger.warning("data.gov.tw: got df from %s", dl_url)
+                            return df
+                    except Exception as exc:
+                        logger.warning("data.gov.tw download %s failed: %s", dl_url, exc)
+        except Exception as exc:
+            logger.warning("data.gov.tw search keyword=%s failed: %s", keyword, exc)
+    raise ValueError("No usable dataset from data.gov.tw search")
+
+
+def _moea_via_datagov_direct() -> Optional[pd.DataFrame]:
+    """
+    Try direct known data.gov.tw dataset resource URLs for MOEA retail stats.
+    Dataset IDs that have historically contained this data.
+    """
+    # These are candidate dataset IDs — try fetching their metadata to get download URLs
+    candidate_ids = ["6889", "25803", "10396"]
+    for dataset_id in candidate_ids:
+        try:
+            meta_url = f"https://data.gov.tw/api/v2/datasets/{dataset_id}"
+            resp = requests.get(meta_url, headers=HEADERS, timeout=15)
+            logger.warning("data.gov.tw dataset %s: HTTP %d", dataset_id, resp.status_code)
+            if resp.status_code != 200:
+                continue
+            resources = resp.json().get("result", {}).get("resources", [])
+            for res in resources:
+                dl_url = res.get("download_url", "")
+                if not dl_url:
+                    continue
+                ext = dl_url.lower().split("?")[0].split(".")[-1]
+                if ext not in ("csv", "xlsx", "xls"):
+                    continue
+                r = requests.get(dl_url, headers=HEADERS, timeout=60)
+                r.raise_for_status()
+                df = _read_csv_bytes(r.content) if ext == "csv" else pd.read_excel(io.BytesIO(r.content), header=None)
+                if df is not None and not df.empty:
+                    return df
+        except Exception as exc:
+            logger.warning("data.gov.tw dataset %s failed: %s", dataset_id, exc)
+    raise ValueError("No usable direct dataset from data.gov.tw")
+
+
+def _moea_via_hub() -> Optional[pd.DataFrame]:
+    """Scrape MOEA statistics pages for retail data, with session warmup."""
+    urls_to_try = [
+        "https://www.moea.gov.tw/Mns/dos/content/wHandMenuFile.ashx?mid=9861",
+        "https://www.moea.gov.tw/Mns/dos/content/Content.aspx?menu_id=9861",
+        "https://www.moea.gov.tw/Mns/dos/home/IndexLink.aspx?mid=9861",
+    ]
+    session = _make_moea_session()
+
+    for hub_url in urls_to_try:
+        try:
+            resp = session.get(hub_url, timeout=30, allow_redirects=True)
+            logger.warning("MOEA hub %s → HTTP %d, %d bytes", hub_url, resp.status_code, len(resp.content))
+            if resp.status_code != 200:
+                continue
+            resp.encoding = "utf-8"
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            links = soup.find_all("a", href=True)
+            logger.warning("MOEA hub: found %d links, first 3: %s",
+                           len(links),
+                           [a["href"] for a in links[:3]])
+
+            for a in links:
+                href = a["href"]
+                if not href.startswith("http"):
+                    href = "https://www.moea.gov.tw" + href
+                # Follow any link to find Excel/CSV
+                if href.endswith((".xlsx", ".xls")):
+                    r = session.get(href, timeout=60)
+                    r.raise_for_status()
+                    df = pd.read_excel(io.BytesIO(r.content), header=None)
+                    if df is not None and not df.empty:
+                        logger.warning("MOEA: downloaded Excel from %s", href)
+                        return df
+                elif href.endswith(".csv"):
+                    r = session.get(href, timeout=60)
+                    r.raise_for_status()
+                    df = _read_csv_bytes(r.content)
+                    if df is not None and not df.empty:
+                        return df
+                elif "dos" in href and any(kw in a.get_text() for kw in ("零售", "批發", "統計", "下載")):
+                    # Follow internal links that might lead to data
+                    try:
+                        r = session.get(href, timeout=20)
+                        r.encoding = "utf-8"
+                        sub = BeautifulSoup(r.text, "html.parser")
+                        for sub_a in sub.find_all("a", href=True):
+                            sub_href = sub_a["href"]
+                            if not sub_href.startswith("http"):
+                                sub_href = "https://www.moea.gov.tw" + sub_href
+                            if sub_href.endswith((".xlsx", ".xls")):
+                                r2 = session.get(sub_href, timeout=60)
+                                r2.raise_for_status()
+                                df = pd.read_excel(io.BytesIO(r2.content), header=None)
+                                if df is not None and not df.empty:
+                                    logger.warning("MOEA: found Excel via sub-link %s", sub_href)
+                                    return df
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("MOEA hub %s failed: %s", hub_url, exc)
+
+    raise ValueError("No Excel/CSV found on any MOEA hub page")
+
+
+def _read_csv_bytes(content: bytes) -> Optional[pd.DataFrame]:
+    for enc in ("utf-8-sig", "big5", "cp950", "utf-8"):
+        try:
+            return pd.read_csv(io.StringIO(content.decode(enc)))
         except (UnicodeDecodeError, pd.errors.ParserError):
             continue
     return None
 
 
-def _scrape_moea_excel() -> Optional[pd.DataFrame]:
-    """
-    Scrape the MOEA statistics page to find the latest retail Excel/CSV file,
-    then download and return as DataFrame.
-    """
-    hub_url = (
-        "https://www.moea.gov.tw/Mns/dos/content/wHandMenuFile.ashx?mid=9861"
-    )
-    resp = requests.get(hub_url, headers=HEADERS, timeout=30)
-    resp.encoding = "utf-8"
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    # Look for links containing 零售 or .xlsx/.csv
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text()
-        if ("零售" in text or "retail" in text.lower()) and (
-            href.endswith(".xlsx") or href.endswith(".xls") or href.endswith(".csv")
-        ):
-            if not href.startswith("http"):
-                href = "https://www.moea.gov.tw" + href
-            file_resp = requests.get(href, headers=HEADERS, timeout=60)
-            file_resp.raise_for_status()
-            if href.endswith(".csv"):
-                return _download_moea_csv(href)
-            else:
-                return pd.read_excel(io.BytesIO(file_resp.content), header=None)
-
-    # Generic fallback: grab first xlsx/xls on the page
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.endswith(".xlsx") or href.endswith(".xls"):
-            if not href.startswith("http"):
-                href = "https://www.moea.gov.tw" + href
-            file_resp = requests.get(href, headers=HEADERS, timeout=60)
-            file_resp.raise_for_status()
-            return pd.read_excel(io.BytesIO(file_resp.content), header=None)
-
-    return None
-
-
 def _parse_moea_overall(df: pd.DataFrame) -> Optional[dict]:
-    """
-    Attempt to extract overall retail figures from a raw MOEA DataFrame.
-    Column names vary by year; we use heuristic matching.
-    """
     try:
-        # Normalise column names
-        df.columns = [str(c).strip() for c in df.columns]
-
-        # Try to find a row labelled '零售業' (retail industry total)
-        mask = df.apply(lambda col: col.astype(str).str.contains("零售業$", regex=True)).any(axis=1)
+        df_str = df.astype(str)
+        mask = df_str.apply(lambda col: col.str.contains("零售業$", regex=True)).any(axis=1)
         row = df[mask]
         if row.empty:
-            # Fallback: first data row after header
             row = df.iloc[[2]]
-
         row = row.iloc[0]
         values = pd.to_numeric(row, errors="coerce").dropna()
-
         if len(values) < 2:
             return None
-
-        # Last two numeric values are assumed to be (previous month, latest month)
         rev_latest = float(values.iloc[-1])
         rev_prev = float(values.iloc[-2])
-
-        # Try to get YoY from the DataFrame if available, else mark N/A
-        yoy = None
-        mom = None
-        if len(values) >= 3:
-            # Some formats include YoY as the second-to-last-but-one column
-            mom = round((rev_latest - rev_prev) / rev_prev * 100, 1) if rev_prev else None
-
-        # Determine month label from DataFrame or use current
-        month_label = _guess_latest_month(df)
-
+        mom = round((rev_latest - rev_prev) / rev_prev * 100, 1) if rev_prev else None
         return {
-            "month": month_label,
-            "revenue_100m": round(rev_latest / 100, 1),  # values in 百萬, convert to 億
-            "yoy_pct": yoy,
+            "month": _guess_latest_month(df),
+            "revenue_100m": round(rev_latest / 100, 1),
+            "yoy_pct": None,
             "mom_pct": mom,
         }
     except Exception as exc:
-        logger.warning("_parse_moea_overall failed: %s", exc)
-        return None
-
-
-def _parse_moea_eyewear(df: pd.DataFrame) -> Optional[dict]:
-    """Extract 眼鏡行 category row."""
-    try:
-        mask = df.apply(lambda col: col.astype(str).str.contains("眼鏡")).any(axis=1)
-        row = df[mask]
-        if row.empty:
-            return None
-        row = row.iloc[0]
-        values = pd.to_numeric(row, errors="coerce").dropna()
-        if len(values) < 1:
-            return None
-        rev_latest = float(values.iloc[-1])
-        rev_prev = float(values.iloc[-2]) if len(values) >= 2 else None
-        yoy = None
-        mom_label = _guess_latest_month(df)
-        return {
-            "month": mom_label,
-            "revenue_100m": round(rev_latest / 100, 1),
-            "yoy_pct": yoy,
-        }
-    except Exception as exc:
-        logger.warning("_parse_moea_eyewear failed: %s", exc)
+        logger.debug("_parse_moea_overall failed: %s", exc)
         return None
 
 
 def _guess_latest_month(df: pd.DataFrame) -> str:
-    """Try to read a year/month header from df, else return current YM."""
     for cell in df.values.flatten():
         s = str(cell)
-        # Match patterns like 11301, 113年1月, 2024/01, etc.
         m = re.search(r"(\d{3})(\d{2})", s)
         if m:
-            roc_year = int(m.group(1))
-            month = int(m.group(2))
-            ce_year = roc_year + 1911
-            return f"{ce_year}年{month}月"
+            roc_year, month = int(m.group(1)), int(m.group(2))
+            if 1 <= month <= 12:
+                return f"{roc_year + 1911}年{month}月"
         m = re.search(r"(\d{4})[年/](\d{1,2})月?", s)
         if m:
             return f"{m.group(1)}年{int(m.group(2))}月"
     now = datetime.now()
-    return f"{now.year}年{now.month}月"
+    month = now.month - 2 if now.month > 2 else now.month + 10
+    year = now.year if now.month > 2 else now.year - 1
+    return f"{year}年{month}月"
 
 
 # ─────────────────────────────────────────────
-# DGBAS 主計總處 — CPI
+# CPI — OECD API (globally accessible)
 # ─────────────────────────────────────────────
 
 def fetch_cpi() -> dict:
     """
-    Fetch the latest CPI data from 主計總處.
-
-    Returns:
-        {month, cpi, yoy_pct, error}
+    Fetch Taiwan CPI from IMF DataMapper API — globally accessible, includes Taiwan.
+    Falls back to World Bank API.
     """
     result = {"month": None, "cpi": None, "yoy_pct": None, "error": None}
 
-    try:
-        # 主計總處 open data API for CPI (總指數)
-        # Dataset: https://www.stat.gov.tw/  /  https://ws.dgbas.gov.tw
-        # We use the open data JSON from data.gov.tw for CPI (dataset 6717 / 6718)
-        api_url = (
-            "https://data.gov.tw/api/v2/datasets/6717"
-            "?format=json&_format=json"
-        )
-        resp = requests.get(api_url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        resources = resp.json().get("result", {}).get("resources", [])
-        csv_url = None
-        for r in resources:
-            url = r.get("download_url", "")
-            if url.lower().endswith(".csv"):
-                csv_url = url
-                break
-
-        if csv_url:
-            df = _download_moea_csv(csv_url)
-            parsed = _parse_cpi_df(df)
-            result.update(parsed)
-        else:
-            raise ValueError("No CSV found for CPI dataset")
-
-    except Exception as exc:
-        logger.warning("CPI data.gov.tw fetch failed: %s", exc)
-        # Fallback: scrape 主計總處 CPI press release page
+    for attempt in (_cpi_via_imf, _cpi_via_worldbank):
         try:
-            result.update(_scrape_dgbas_cpi())
-        except Exception as exc2:
-            result["error"] = f"CPI data unavailable: {exc2}"
+            parsed = attempt()
+            if parsed.get("yoy_pct") is not None or parsed.get("cpi") is not None:
+                result.update(parsed)
+                logger.info("CPI fetched via %s", attempt.__name__)
+                return result
+        except Exception as exc:
+            logger.warning("CPI %s failed: %s", attempt.__name__, exc)
 
+    result["error"] = "CPI 資料暫時無法取得"
+    logger.warning("All CPI fetch attempts failed")
     return result
 
 
-def _parse_cpi_df(df: pd.DataFrame) -> dict:
-    """Parse a CPI DataFrame and return latest entry."""
-    if df is None or df.empty:
-        raise ValueError("Empty CPI dataframe")
+def _cpi_via_imf() -> dict:
+    """
+    IMF DataMapper API — PCPIPCH = CPI annual % change for Taiwan (TWN).
+    Returns latest available annual YoY inflation rate.
+    Free, no auth, globally accessible.
+    """
+    url = "https://www.imf.org/external/datamapper/api/v1/PCPIPCH/TWN"
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
 
-    df.columns = [str(c).strip() for c in df.columns]
+    values = data.get("values", {}).get("PCPIPCH", {}).get("TWN", {})
+    if not values:
+        raise ValueError("No IMF PCPIPCH data for TWN")
 
-    # Look for column containing '總指數' or 'CPI'
-    cpi_col = None
-    for col in df.columns:
-        if "總指數" in col or "CPI" in col.upper() or "綜合" in col:
-            cpi_col = col
-            break
-    if cpi_col is None:
-        # Use last numeric column
-        numeric_cols = df.select_dtypes(include="number").columns
-        if len(numeric_cols) == 0:
-            raise ValueError("No numeric columns in CPI dataframe")
-        cpi_col = numeric_cols[-1]
+    # Filter out future forecasts — only use confirmed historical years
+    current_year = datetime.now().year
+    historical = {y: v for y, v in values.items() if int(y) < current_year and v is not None}
+    if not historical:
+        raise ValueError("No historical IMF data for TWN")
 
-    # Find month column
-    month_col = df.columns[0]
+    latest_year = max(historical.keys(), key=lambda y: int(y))
+    yoy = round(float(historical[latest_year]), 2)
 
-    df = df.dropna(subset=[cpi_col])
-    latest = df.iloc[-1]
-    prev_year = df.iloc[-13] if len(df) >= 13 else None
-
-    cpi_val = float(latest[cpi_col])
-    month_label = str(latest[month_col])
-
-    yoy = None
-    if prev_year is not None:
-        prev_cpi = float(prev_year[cpi_col])
-        yoy = round((cpi_val - prev_cpi) / prev_cpi * 100, 2)
-
-    # Normalise month label
-    m = re.search(r"(\d{3,4})[年/](\d{1,2})", month_label)
-    if m:
-        y = int(m.group(1))
-        mo = int(m.group(2))
-        if y < 200:
-            y += 1911
-        month_label = f"{y}年{mo}月"
-
-    return {"month": month_label, "cpi": round(cpi_val, 2), "yoy_pct": yoy}
+    return {
+        "month": f"{latest_year}年（年均）",
+        "cpi": None,
+        "yoy_pct": yoy,
+    }
 
 
-def _scrape_dgbas_cpi() -> dict:
-    """Scrape 主計總處 CPI statistics page as fallback."""
-    url = "https://www.stat.gov.tw/News_Content.aspx?n=2672&s=66461"
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    resp.encoding = "utf-8"
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Find a table with CPI data
-    tables = soup.find_all("table")
-    for table in tables:
-        rows = table.find_all("tr")
-        for row in rows:
-            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-            if len(cells) >= 2 and "總指數" in cells[0]:
-                try:
-                    cpi_val = float(cells[-1].replace(",", ""))
-                    return {
-                        "month": _guess_current_month(),
-                        "cpi": cpi_val,
-                        "yoy_pct": None,
-                    }
-                except ValueError:
-                    continue
-
-    raise ValueError("Could not parse CPI from DGBAS page")
-
-
-def _guess_current_month() -> str:
-    now = datetime.now()
-    return f"{now.year}年{now.month}月"
+def _cpi_via_worldbank() -> dict:
+    """
+    World Bank API — FP.CPI.TOTL.ZG = CPI annual % change for Taiwan (TW).
+    """
+    url = (
+        "https://api.worldbank.org/v2/country/TW/indicator/FP.CPI.TOTL.ZG"
+        "?format=json&mrv=3&per_page=3"
+    )
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+    body = resp.json()
+    records = body[1] if len(body) > 1 else []
+    for rec in records:
+        if rec.get("value") is not None:
+            yoy = round(float(rec["value"]), 2)
+            year = rec.get("date", "")
+            return {
+                "month": f"{year}年（年均）",
+                "cpi": None,
+                "yoy_pct": yoy,
+            }
+    raise ValueError("No World Bank CPI data")
 
 
 # ─────────────────────────────────────────────
-# MOPS 公開資訊觀測站 — 寶島光學科技 (5312, 上櫃)
+# MOPS 公開資訊觀測站 — 寶島光學科技 (5312)
 # ─────────────────────────────────────────────
 
 BAODAO_CO_ID = "5312"
 BAODAO_TYPEK = "otc"  # 上櫃
 
 def fetch_mops_baodao() -> dict:
-    """
-    Fetch monthly revenue + quarterly financials for 寶島光學科技 (5312, OTC)
-    from 公開資訊觀測站 MOPS.
-
-    Returns:
-        {period, revenue_100m, net_income_100m, gross_margin_pct, error}
-    """
     result = {
         "period": None,
         "revenue_100m": None,
-        "net_income_100m": None,
         "gross_margin_pct": None,
+        "net_income_100m": None,
         "error": None,
     }
 
     try:
-        # Establish MOPS session (AJAX endpoints require a prior session cookie)
+        # Establish MOPS session first (required for AJAX endpoints to return tables)
         session = requests.Session()
         session.headers.update(HEADERS)
         session.get("https://mops.twse.com.tw/mops/web/index", timeout=15)
 
-        # Monthly revenue — OTC companies use t05st10_1
+        # 上櫃(otc) 用 ajax_t05st10_1
         url = "https://mops.twse.com.tw/mops/web/ajax_t05st10_1"
         session.headers["Referer"] = "https://mops.twse.com.tw/mops/web/t05st10_1"
         payload = {
@@ -407,18 +379,27 @@ def fetch_mops_baodao() -> dict:
         resp.encoding = "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        logger.warning("MOPS monthly: HTTP %d, tables=%d", resp.status_code, len(soup.find_all("table")))
+        tables = soup.find_all("table")
+        logger.warning("MOPS 5312 otc: HTTP %d, tables=%d", resp.status_code, len(tables))
 
-        for table in soup.find_all("table"):
+        for ti, table in enumerate(tables):
+            rows = table.find_all("tr")
+            for row in rows[:5]:
+                cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                if cells:
+                    logger.warning("MOPS table[%d] row sample: %s", ti, cells[:4])
+                    break
+
+        for table in tables:
             for row in table.find_all("tr"):
                 cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
                 if not cells:
                     continue
-                # Date patterns: "115年1月", "115/01", or 5-digit "11501"
-                if len(cells) >= 2 and (
+                date_match = (
                     re.search(r"\d{3}[年/]\d{1,2}", cells[0])
                     or (len(cells[0]) == 5 and cells[0].isdigit())
-                ):
+                )
+                if len(cells) >= 2 and date_match:
                     try:
                         revenue_k = float(cells[1].replace(",", ""))
                         result["period"] = cells[0]
@@ -427,8 +408,9 @@ def fetch_mops_baodao() -> dict:
                         pass
                     break
 
-        # Quarterly financials
-        _enrich_quarterly(result, session)
+        if result["period"]:
+            logger.info("MOPS fetched: period=%s", result["period"])
+            _enrich_quarterly(result, session)
 
     except Exception as exc:
         logger.warning("MOPS fetch failed: %s", exc)
@@ -437,23 +419,16 @@ def fetch_mops_baodao() -> dict:
     return result
 
 
-def _enrich_quarterly(result: dict, session: requests.Session = None) -> None:
-    """Fetch latest quarterly income statement for gross margin and net income."""
+def _enrich_quarterly(result: dict, session: Optional[requests.Session] = None) -> None:
     try:
         now = datetime.now()
         roc_year = now.year - 1911
-        # Latest published quarter (financial reports lag ~45 days)
         quarter = (now.month - 1) // 3
         if quarter == 0:
             quarter = 4
             roc_year -= 1
 
-        if session is None:
-            session = requests.Session()
-            session.headers.update(HEADERS)
-
         url = "https://mops.twse.com.tw/mops/web/ajax_t163sb04"
-        session.headers["Referer"] = "https://mops.twse.com.tw/mops/web/t163sb04"
         payload = {
             "encodeURIComponent": "1",
             "step": "1",
@@ -464,51 +439,26 @@ def _enrich_quarterly(result: dict, session: requests.Session = None) -> None:
             "season": str(quarter).zfill(2),
             "TYPEK": BAODAO_TYPEK,
         }
-        resp = session.post(url, data=payload, timeout=30)
+        requester = session if session else requests
+        resp = requester.post(url, data=payload, headers=HEADERS, timeout=30)
         resp.encoding = "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        logger.warning("MOPS quarterly: HTTP %d, tables=%d", resp.status_code, len(soup.find_all("table")))
-
-        tables = soup.find_all("table")
-        for table in tables:
-            rows = table.find_all("tr")
-            for row in rows:
+        for table in soup.find_all("table"):
+            for row in table.find_all("tr"):
                 cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-                if "營業收入" in " ".join(cells) or "收入合計" in " ".join(cells):
-                    for cell in cells:
-                        try:
-                            val = float(cell.replace(",", ""))
-                            result["revenue_100m"] = round(val / 100_000, 2)
-                            result["period"] = f"{roc_year + 1911}Q{quarter}"
-                            break
-                        except ValueError:
-                            continue
-                if "稅後淨利" in " ".join(cells) or "本期淨利" in " ".join(cells):
+                text = " ".join(cells)
+                if "稅後淨利" in text or "本期淨利" in text:
                     for cell in cells:
                         try:
                             val = float(cell.replace(",", ""))
                             result["net_income_100m"] = round(val / 100_000, 2)
+                            result["period"] = f"{roc_year + 1911}Q{quarter}"
                             break
                         except ValueError:
                             continue
-                if "營業毛利" in " ".join(cells):
-                    rev = result.get("revenue_100m")
-                    for cell in cells:
-                        try:
-                            val = float(cell.replace(",", ""))
-                            gross = round(val / 100_000, 2)
-                            # Calculate gross margin % if we have revenue
-                            if rev and rev > 0:
-                                result["gross_margin_pct"] = round(gross / rev * 100, 1)
-                            break
-                        except ValueError:
-                            continue
-                if result.get("net_income_100m") is not None:
-                    result["period"] = f"{roc_year + 1911}Q{quarter}"
-
     except Exception as exc:
-        logger.warning("Quarterly enrichment failed: %s", exc)
+        logger.debug("Quarterly enrichment failed: %s", exc)
 
 
 # ─────────────────────────────────────────────
@@ -516,14 +466,10 @@ def _enrich_quarterly(result: dict, session: requests.Session = None) -> None:
 # ─────────────────────────────────────────────
 
 def fetch_all() -> dict:
-    """
-    Fetch all data sources and return a combined dict.
-    Never raises — each source records its own error.
-    """
     logger.info("Fetching MOEA retail data…")
     moea = fetch_moea_retail()
 
-    logger.info("Fetching CPI data…")
+    logger.info("Fetching CPI data (OECD API)…")
     cpi = fetch_cpi()
 
     logger.info("Fetching MOPS 寶島光學科技 (5312) data…")
