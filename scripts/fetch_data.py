@@ -364,6 +364,9 @@ def fetch_mops_baodao() -> dict:
         "week52_low": None,
         "market_cap_100m": None,
         "revenue_yoy_pct": None,
+        "latest_q_label": None,
+        "latest_q_revenue_100m": None,
+        "latest_q_yoy_pct": None,
         "error": None,
     }
 
@@ -414,19 +417,15 @@ def fetch_mops_baodao() -> dict:
 
 
 def _calc_ytd_revenue(ticker, result: dict) -> None:
-    """從季報計算 YTD 累計營收及 YoY%。"""
+    """從季報取最新季 + 全年累計，並計算 YoY%。"""
     try:
-        import yfinance as yf
-        # quarterly_income_stmt: columns = quarter-end dates, rows = line items
         stmt = ticker.quarterly_income_stmt
         if stmt is None or stmt.empty:
-            # fallback to older API
             stmt = ticker.quarterly_financials
         if stmt is None or stmt.empty:
             logger.warning("yfinance: no quarterly financials")
             return
 
-        # Find revenue row
         revenue_row = None
         for idx in stmt.index:
             if "revenue" in str(idx).lower() or "total revenue" in str(idx).lower():
@@ -436,41 +435,60 @@ def _calc_ytd_revenue(ticker, result: dict) -> None:
             logger.warning("yfinance: revenue row not found, index=%s", list(stmt.index)[:5])
             return
 
-        # Sort columns (dates) descending
         revenue_row = revenue_row.dropna().sort_index(ascending=False)
         logger.warning("yfinance quarterly revenue dates: %s", list(revenue_row.index))
 
         now = datetime.now()
         current_year = now.year
 
-        # Sum quarters in current year
-        ytd_quarters = [(d, v) for d, v in revenue_row.items() if d.year == current_year]
-        prev_quarters = [(d, v) for d, v in revenue_row.items() if d.year == current_year - 1]
+        by_year: dict = {}
+        for d, v in revenue_row.items():
+            by_year.setdefault(d.year, []).append((d, v))
 
-        if not ytd_quarters:
-            # No current year data yet, use previous year YTD
-            ytd_quarters = prev_quarters
-            prev_quarters = [(d, v) for d, v in revenue_row.items() if d.year == current_year - 2]
-            label_year = current_year - 1
-        else:
-            label_year = current_year
-
-        if not ytd_quarters:
+        # Find the most recent year with data
+        data_years = sorted(by_year.keys(), reverse=True)
+        if not data_years:
             return
 
-        n_quarters = len(ytd_quarters)
-        ytd_total = sum(v for _, v in ytd_quarters)
-        result["revenue_100m"] = round(ytd_total / 100_000_000, 2)
-        result["period"] = f"{label_year} Q1–Q{n_quarters} YTD"
+        latest_year = data_years[0]
+        # If current year has no data, use latest available
+        if latest_year < current_year:
+            label_note = f"（{current_year} Q1 資料待更新）"
+        else:
+            label_note = ""
 
-        # YoY: same number of quarters from previous year
-        same_n_prev = [v for _, v in sorted(prev_quarters, reverse=True)[:n_quarters]]
-        if len(same_n_prev) == n_quarters:
-            prev_total = sum(same_n_prev)
+        latest_quarters = sorted(by_year[latest_year], reverse=True)  # newest first
+        prev_year = latest_year - 1
+        prev_quarters = sorted(by_year.get(prev_year, []), reverse=True)
+
+        # Most recent single quarter + YoY
+        latest_q_date, latest_q_val = latest_quarters[0]
+        q_num = (latest_q_date.month + 2) // 3
+        result["latest_q_label"] = f"{latest_year} Q{q_num}"
+        result["latest_q_revenue_100m"] = round(latest_q_val / 100_000_000, 2)
+
+        # Same quarter prior year
+        same_q_prev = [v for d, v in prev_quarters if (d.month + 2) // 3 == q_num]
+        if same_q_prev:
+            prev_val = same_q_prev[0]
+            result["latest_q_yoy_pct"] = round((latest_q_val - prev_val) / prev_val * 100, 1)
+
+        # Full year cumulative (all quarters of latest_year)
+        year_total = sum(v for _, v in latest_quarters)
+        n_q = len(latest_quarters)
+        result["revenue_100m"] = round(year_total / 100_000_000, 2)
+        result["period"] = f"{latest_year} Q1–Q{n_q}{label_note}"
+
+        # YoY for same n quarters of prev year
+        same_n_prev_vals = [v for _, v in prev_quarters[:n_q]]
+        if len(same_n_prev_vals) == n_q:
+            prev_total = sum(same_n_prev_vals)
             if prev_total:
-                result["revenue_yoy_pct"] = round((ytd_total - prev_total) / prev_total * 100, 1)
+                result["revenue_yoy_pct"] = round((year_total - prev_total) / prev_total * 100, 1)
 
-        logger.info("YTD revenue: %s %s億, YoY=%s%%",
+        logger.info("Revenue: latest_q=%s %.2f億 YoY=%s%%, full=%s %.2f億 YoY=%s%%",
+                    result.get("latest_q_label"), result.get("latest_q_revenue_100m"),
+                    result.get("latest_q_yoy_pct"),
                     result["period"], result["revenue_100m"],
                     result.get("revenue_yoy_pct"))
 

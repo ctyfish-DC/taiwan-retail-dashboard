@@ -77,11 +77,15 @@ def build_message(data: dict) -> str:
         lines.append(f"52週: {mops['week52_low']:.1f} – {mops['week52_high']:.1f} 元")
     if mops.get("market_cap_100m") is not None:
         lines.append(f"市值: {mops['market_cap_100m']:.1f} 億元")
+    if mops.get("latest_q_label") is not None:
+        q_yoy = mops.get("latest_q_yoy_pct")
+        q_yoy_str = f"  YoY {_fmt_pct(q_yoy)}" if q_yoy is not None else ""
+        lines.append(f"營收 ({mops['latest_q_label']}): {_fmt_100m(mops.get('latest_q_revenue_100m'))}{q_yoy_str}")
     if mops.get("revenue_100m") is not None:
-        label = mops.get("period", "YTD")
+        label = mops.get("period", "累計")
         yoy = mops.get("revenue_yoy_pct")
         yoy_str = f"  YoY {_fmt_pct(yoy)}" if yoy is not None else ""
-        lines.append(f"營收 ({label}): {_fmt_100m(mops.get('revenue_100m'))}{yoy_str}")
+        lines.append(f"累計營收 ({label}): {_fmt_100m(mops.get('revenue_100m'))}{yoy_str}")
     if mops.get("gross_margin_pct") is not None:
         lines.append(f"毛利率: {mops['gross_margin_pct']:.1f}%")
     if mops.get("net_income_100m") is not None:
