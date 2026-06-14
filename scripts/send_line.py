@@ -90,7 +90,7 @@ def build_message(data: dict) -> str:
     lines.append("")
 
     lines.append("─────────────────")
-    lines.append("資料來源: 經濟部統計處 / 主計總處 / TPEX")
+    lines.append("資料來源: 經濟部統計處 / 主計總處 / Yahoo Finance")
 
     return "\n".join(lines)
 
