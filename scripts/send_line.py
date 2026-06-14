@@ -70,24 +70,22 @@ def build_message(data: dict) -> str:
     lines.append("【寶島光學科技 (5312)】")
 
     if mops.get("close_price") is not None:
-        chg = mops.get("price_change")
-        chg_str = f"  ({_fmt_pct(chg)})" if chg is not None else ""
-        lines.append(f"股價: {mops['close_price']:.1f} 元{chg_str}")
-
-    if mops.get("period"):
-        lines.append(f"月營收 ({mops['period']}): {_fmt_100m(mops.get('revenue_100m'))}")
+        chg = mops.get("price_change_pct")
+        chg_str = f"（{_fmt_pct(chg)}）" if chg is not None else ""
+        lines.append(f"股價: {mops['close_price']:.1f} 元 {chg_str}".strip())
+    if mops.get("week52_high") is not None:
+        lines.append(f"52週: {mops['week52_low']:.1f} – {mops['week52_high']:.1f} 元")
+    if mops.get("market_cap_100m") is not None:
+        lines.append(f"市值: {mops['market_cap_100m']:.1f} 億元")
+    if mops.get("revenue_100m") is not None:
+        label = mops.get("period", "近12月")
+        lines.append(f"營收 ({label}): {_fmt_100m(mops.get('revenue_100m'))}")
     if mops.get("gross_margin_pct") is not None:
         lines.append(f"毛利率: {mops['gross_margin_pct']:.1f}%")
     if mops.get("net_income_100m") is not None:
         lines.append(f"稅後淨利: {_fmt_100m(mops.get('net_income_100m'))}")
 
-    announcements = mops.get("announcements", [])
-    if announcements:
-        lines.append("近期重大訊息:")
-        for ann in announcements:
-            lines.append(f"  · {ann}")
-
-    if not mops.get("period") and mops.get("close_price") is None and not announcements:
+    if mops.get("close_price") is None and mops.get("revenue_100m") is None:
         lines.append("暫無資料")
     lines.append("")
 

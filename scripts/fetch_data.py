@@ -349,15 +349,16 @@ def _cpi_via_worldbank() -> dict:
 BAODAO_CO_ID = "5312"
 BAODAO_TYPEK = "otc"
 
-TPEX_HEADERS = {
+YAHOO_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json",
-    "Referer": "https://www.tpex.org.tw/",
 }
+
+BAODAO_TICKER = f"{BAODAO_CO_ID}.TWO"  # Yahoo Finance OTC Taiwan ticker
 
 
 def fetch_mops_baodao() -> dict:
@@ -367,116 +368,83 @@ def fetch_mops_baodao() -> dict:
         "gross_margin_pct": None,
         "net_income_100m": None,
         "close_price": None,
-        "price_change": None,
-        "announcements": [],
+        "price_change_pct": None,
+        "week52_high": None,
+        "week52_low": None,
+        "market_cap_100m": None,
         "error": None,
     }
 
-    _fetch_tpex_monthly_revenue(result)
-    _fetch_tpex_stock_price(result)
-    _fetch_tpex_announcements(result)
+    _fetch_yahoo_quote(result)
+    _fetch_yahoo_financials(result)
 
-    if result["period"] or result["close_price"]:
-        logger.info("寶島 5312 data fetched OK")
+    if result["close_price"] is not None:
+        logger.info("寶島 5312 Yahoo Finance OK: price=%s", result["close_price"])
     else:
-        logger.warning("寶島 5312: no data from TPEX APIs")
+        logger.warning("寶島 5312: no data from Yahoo Finance")
 
     return result
 
 
-def _fetch_tpex_monthly_revenue(result: dict) -> None:
-    """月營收 from TPEX OpenAPI."""
+def _fetch_yahoo_quote(result: dict) -> None:
+    """股價、52週高低、市值 from Yahoo Finance."""
     try:
-        now = datetime.now()
-        # Try current month, fall back to previous month
-        for delta in (0, 1, 2):
-            month = now.month - delta
-            year = now.year
-            if month <= 0:
-                month += 12
-                year -= 1
-            roc_year = year - 1911
-            url = (
-                "https://www.tpex.org.tw/openapi/v1/tpex_stk_monthly_sales_report"
-                f"?l=zh-tw&se=EW&stock={BAODAO_CO_ID}&y={roc_year}&m={month}"
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{BAODAO_TICKER}"
+            "?interval=1d&range=5d"
+        )
+        resp = requests.get(url, headers=YAHOO_HEADERS, timeout=15)
+        logger.warning("Yahoo chart HTTP %d", resp.status_code)
+        if resp.status_code != 200:
+            return
+        data = resp.json()
+        meta = data["chart"]["result"][0]["meta"]
+        result["close_price"] = meta.get("regularMarketPrice")
+        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+        if result["close_price"] and prev_close:
+            result["price_change_pct"] = round(
+                (result["close_price"] - prev_close) / prev_close * 100, 2
             )
-            resp = requests.get(url, headers=TPEX_HEADERS, timeout=15)
-            logger.warning("TPEX monthly revenue HTTP %d, url=%s", resp.status_code, url)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            if not data:
-                continue
-            row = data[0] if isinstance(data, list) else data
-            # Fields vary; try common keys
-            revenue_val = None
-            for key in ("revenue", "當月營收", "Revenue"):
-                if key in row:
-                    try:
-                        revenue_val = float(str(row[key]).replace(",", ""))
-                    except ValueError:
-                        pass
-                    break
-            logger.warning("TPEX row keys: %s", list(row.keys())[:8])
-            if revenue_val is not None:
-                result["period"] = f"{year}年{month}月"
-                result["revenue_100m"] = round(revenue_val / 100_000_000, 2)
-                logger.info("TPEX monthly revenue: %s %s億", result["period"], result["revenue_100m"])
-                return
+        result["week52_high"] = meta.get("fiftyTwoWeekHigh")
+        result["week52_low"] = meta.get("fiftyTwoWeekLow")
+        market_cap = meta.get("marketCap")
+        if market_cap:
+            result["market_cap_100m"] = round(market_cap / 100_000_000, 1)
     except Exception as exc:
-        logger.warning("TPEX monthly revenue failed: %s", exc)
+        logger.warning("Yahoo chart failed: %s", exc)
 
 
-def _fetch_tpex_stock_price(result: dict) -> None:
-    """最新收盤價 from TPEX OpenAPI."""
+def _fetch_yahoo_financials(result: dict) -> None:
+    """財務摘要（毛利率、營收）from Yahoo Finance quoteSummary."""
     try:
-        now = datetime.now()
-        date_str = now.strftime("%Y%m%d")
-        url = f"https://www.tpex.org.tw/openapi/v1/tpex_stk_daily_close?date={date_str}&symbolId={BAODAO_CO_ID}"
-        resp = requests.get(url, headers=TPEX_HEADERS, timeout=15)
-        logger.warning("TPEX stock price HTTP %d", resp.status_code)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data:
-                row = data[0] if isinstance(data, list) else data
-                logger.warning("TPEX price keys: %s", list(row.keys())[:8])
-                for key in ("closePrice", "Close", "收盤價", "close"):
-                    if key in row:
-                        try:
-                            result["close_price"] = float(str(row[key]).replace(",", ""))
-                        except ValueError:
-                            pass
-                        break
-                for key in ("change", "漲跌", "Change"):
-                    if key in row:
-                        try:
-                            result["price_change"] = float(str(row[key]).replace(",", ""))
-                        except ValueError:
-                            pass
-                        break
-    except Exception as exc:
-        logger.warning("TPEX stock price failed: %s", exc)
+        url = (
+            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{BAODAO_TICKER}"
+            "?modules=financialData,defaultKeyStatistics,incomeStatementHistory"
+        )
+        resp = requests.get(url, headers=YAHOO_HEADERS, timeout=15)
+        logger.warning("Yahoo financials HTTP %d", resp.status_code)
+        if resp.status_code != 200:
+            return
+        data = resp.json()
+        summary = data.get("quoteSummary", {}).get("result", [{}])[0]
 
+        fin = summary.get("financialData", {})
+        gross_margins = fin.get("grossMargins", {}).get("raw")
+        if gross_margins is not None:
+            result["gross_margin_pct"] = round(gross_margins * 100, 1)
 
-def _fetch_tpex_announcements(result: dict) -> None:
-    """近期重大訊息 from TPEX."""
-    try:
-        url = f"https://www.tpex.org.tw/openapi/v1/tpex_material_information?symbolId={BAODAO_CO_ID}"
-        resp = requests.get(url, headers=TPEX_HEADERS, timeout=15)
-        logger.warning("TPEX announcements HTTP %d", resp.status_code)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list):
-                announcements = []
-                for item in data[:3]:
-                    title = item.get("subject") or item.get("title") or item.get("標題") or ""
-                    date = item.get("date") or item.get("公告日期") or ""
-                    if title:
-                        announcements.append(f"{date} {title}".strip())
-                result["announcements"] = announcements
-                logger.info("TPEX announcements: %d items", len(announcements))
+        total_revenue = fin.get("totalRevenue", {}).get("raw")
+        if total_revenue:
+            result["revenue_100m"] = round(total_revenue / 100_000_000, 2)
+            result["period"] = "最近12個月"
+
+        net_income = fin.get("netIncomeToCommon", {})
+        if isinstance(net_income, dict):
+            val = net_income.get("raw")
+            if val:
+                result["net_income_100m"] = round(val / 100_000_000, 2)
     except Exception as exc:
-        logger.warning("TPEX announcements failed: %s", exc)
+        logger.warning("Yahoo financials failed: %s", exc)
 
 
 # ─────────────────────────────────────────────
