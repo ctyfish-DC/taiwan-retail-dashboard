@@ -343,21 +343,10 @@ def _cpi_via_worldbank() -> dict:
 
 
 # ─────────────────────────────────────────────
-# 寶島光學科技 (5312, 上櫃) — TPEX OpenAPI
+# 寶島光學科技 (5312, 上櫃) — yfinance
 # ─────────────────────────────────────────────
 
 BAODAO_CO_ID = "5312"
-BAODAO_TYPEK = "otc"
-
-YAHOO_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-}
-
 BAODAO_TICKER = f"{BAODAO_CO_ID}.TWO"  # Yahoo Finance OTC Taiwan ticker
 
 
@@ -375,76 +364,52 @@ def fetch_mops_baodao() -> dict:
         "error": None,
     }
 
-    _fetch_yahoo_quote(result)
-    _fetch_yahoo_financials(result)
-
-    if result["close_price"] is not None:
-        logger.info("寶島 5312 Yahoo Finance OK: price=%s", result["close_price"])
-    else:
-        logger.warning("寶島 5312: no data from Yahoo Finance")
-
-    return result
-
-
-def _fetch_yahoo_quote(result: dict) -> None:
-    """股價、52週高低、市值 from Yahoo Finance."""
     try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{BAODAO_TICKER}"
-            "?interval=1d&range=5d"
-        )
-        resp = requests.get(url, headers=YAHOO_HEADERS, timeout=15)
-        logger.warning("Yahoo chart HTTP %d", resp.status_code)
-        if resp.status_code != 200:
-            return
-        data = resp.json()
-        meta = data["chart"]["result"][0]["meta"]
-        result["close_price"] = meta.get("regularMarketPrice")
-        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+        import yfinance as yf
+        ticker = yf.Ticker(BAODAO_TICKER)
+
+        # 股價資訊
+        info = ticker.info
+        logger.warning("yfinance info keys sample: %s", list(info.keys())[:10])
+
+        result["close_price"] = info.get("currentPrice") or info.get("regularMarketPrice")
+        result["week52_high"] = info.get("fiftyTwoWeekHigh")
+        result["week52_low"] = info.get("fiftyTwoWeekLow")
+
+        market_cap = info.get("marketCap")
+        if market_cap:
+            result["market_cap_100m"] = round(market_cap / 100_000_000, 1)
+
+        prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose")
         if result["close_price"] and prev_close:
             result["price_change_pct"] = round(
                 (result["close_price"] - prev_close) / prev_close * 100, 2
             )
-        result["week52_high"] = meta.get("fiftyTwoWeekHigh")
-        result["week52_low"] = meta.get("fiftyTwoWeekLow")
-        market_cap = meta.get("marketCap")
-        if market_cap:
-            result["market_cap_100m"] = round(market_cap / 100_000_000, 1)
-    except Exception as exc:
-        logger.warning("Yahoo chart failed: %s", exc)
 
-
-def _fetch_yahoo_financials(result: dict) -> None:
-    """財務摘要（毛利率、營收）from Yahoo Finance quoteSummary."""
-    try:
-        url = (
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{BAODAO_TICKER}"
-            "?modules=financialData,defaultKeyStatistics,incomeStatementHistory"
-        )
-        resp = requests.get(url, headers=YAHOO_HEADERS, timeout=15)
-        logger.warning("Yahoo financials HTTP %d", resp.status_code)
-        if resp.status_code != 200:
-            return
-        data = resp.json()
-        summary = data.get("quoteSummary", {}).get("result", [{}])[0]
-
-        fin = summary.get("financialData", {})
-        gross_margins = fin.get("grossMargins", {}).get("raw")
+        # 財務數據
+        gross_margins = info.get("grossMargins")
         if gross_margins is not None:
             result["gross_margin_pct"] = round(gross_margins * 100, 1)
 
-        total_revenue = fin.get("totalRevenue", {}).get("raw")
+        total_revenue = info.get("totalRevenue")
         if total_revenue:
             result["revenue_100m"] = round(total_revenue / 100_000_000, 2)
             result["period"] = "最近12個月"
 
-        net_income = fin.get("netIncomeToCommon", {})
-        if isinstance(net_income, dict):
-            val = net_income.get("raw")
-            if val:
-                result["net_income_100m"] = round(val / 100_000_000, 2)
+        net_income = info.get("netIncomeToCommon")
+        if net_income:
+            result["net_income_100m"] = round(net_income / 100_000_000, 2)
+
+        if result["close_price"]:
+            logger.info("寶島 5312 yfinance OK: price=%s", result["close_price"])
+        else:
+            logger.warning("寶島 5312: price not found in yfinance info")
+
     except Exception as exc:
-        logger.warning("Yahoo financials failed: %s", exc)
+        logger.warning("yfinance failed: %s", exc)
+        result["error"] = str(exc)
+
+    return result
 
 
 # ─────────────────────────────────────────────
