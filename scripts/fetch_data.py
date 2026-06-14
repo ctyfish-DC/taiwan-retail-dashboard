@@ -362,7 +362,9 @@ def fetch_mops_baodao() -> dict:
     try:
         session = requests.Session()
         session.headers.update(HEADERS)
+        # Must visit index then the specific page to establish session cookies
         session.get("https://mops.twse.com.tw/mops/web/index", timeout=15)
+        session.get("https://mops.twse.com.tw/mops/web/t05st10_1", timeout=15)
 
         url = "https://mops.twse.com.tw/mops/web/ajax_t05st10_1"
         session.headers["Referer"] = "https://mops.twse.com.tw/mops/web/t05st10_1"
