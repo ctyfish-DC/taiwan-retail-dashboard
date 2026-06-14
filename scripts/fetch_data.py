@@ -363,6 +363,7 @@ def fetch_mops_baodao() -> dict:
         "week52_high": None,
         "week52_low": None,
         "market_cap_100m": None,
+        "revenue_yoy_pct": None,
         "error": None,
     }
 
@@ -393,14 +394,12 @@ def fetch_mops_baodao() -> dict:
         if gross_margins is not None:
             result["gross_margin_pct"] = round(gross_margins * 100, 1)
 
-        total_revenue = info.get("totalRevenue")
-        if total_revenue:
-            result["revenue_100m"] = round(total_revenue / 100_000_000, 2)
-            result["period"] = "最近12個月"
-
         net_income = info.get("netIncomeToCommon")
         if net_income:
             result["net_income_100m"] = round(net_income / 100_000_000, 2)
+
+        # YTD 累計營收 + YoY（從季報加總）
+        _calc_ytd_revenue(ticker, result)
 
         if result["close_price"]:
             logger.info("寶島 5312 yfinance OK: price=%s", result["close_price"])
@@ -412,6 +411,71 @@ def fetch_mops_baodao() -> dict:
         result["error"] = str(exc)
 
     return result
+
+
+def _calc_ytd_revenue(ticker, result: dict) -> None:
+    """從季報計算 YTD 累計營收及 YoY%。"""
+    try:
+        import yfinance as yf
+        # quarterly_income_stmt: columns = quarter-end dates, rows = line items
+        stmt = ticker.quarterly_income_stmt
+        if stmt is None or stmt.empty:
+            # fallback to older API
+            stmt = ticker.quarterly_financials
+        if stmt is None or stmt.empty:
+            logger.warning("yfinance: no quarterly financials")
+            return
+
+        # Find revenue row
+        revenue_row = None
+        for idx in stmt.index:
+            if "revenue" in str(idx).lower() or "total revenue" in str(idx).lower():
+                revenue_row = stmt.loc[idx]
+                break
+        if revenue_row is None:
+            logger.warning("yfinance: revenue row not found, index=%s", list(stmt.index)[:5])
+            return
+
+        # Sort columns (dates) descending
+        revenue_row = revenue_row.dropna().sort_index(ascending=False)
+        logger.warning("yfinance quarterly revenue dates: %s", list(revenue_row.index))
+
+        now = datetime.now()
+        current_year = now.year
+
+        # Sum quarters in current year
+        ytd_quarters = [(d, v) for d, v in revenue_row.items() if d.year == current_year]
+        prev_quarters = [(d, v) for d, v in revenue_row.items() if d.year == current_year - 1]
+
+        if not ytd_quarters:
+            # No current year data yet, use previous year YTD
+            ytd_quarters = prev_quarters
+            prev_quarters = [(d, v) for d, v in revenue_row.items() if d.year == current_year - 2]
+            label_year = current_year - 1
+        else:
+            label_year = current_year
+
+        if not ytd_quarters:
+            return
+
+        n_quarters = len(ytd_quarters)
+        ytd_total = sum(v for _, v in ytd_quarters)
+        result["revenue_100m"] = round(ytd_total / 100_000_000, 2)
+        result["period"] = f"{label_year} Q1–Q{n_quarters} YTD"
+
+        # YoY: same number of quarters from previous year
+        same_n_prev = [v for _, v in sorted(prev_quarters, reverse=True)[:n_quarters]]
+        if len(same_n_prev) == n_quarters:
+            prev_total = sum(same_n_prev)
+            if prev_total:
+                result["revenue_yoy_pct"] = round((ytd_total - prev_total) / prev_total * 100, 1)
+
+        logger.info("YTD revenue: %s %s億, YoY=%s%%",
+                    result["period"], result["revenue_100m"],
+                    result.get("revenue_yoy_pct"))
+
+    except Exception as exc:
+        logger.warning("YTD revenue calc failed: %s", exc)
 
 
 # ─────────────────────────────────────────────

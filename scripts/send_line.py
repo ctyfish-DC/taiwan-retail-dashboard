@@ -78,8 +78,10 @@ def build_message(data: dict) -> str:
     if mops.get("market_cap_100m") is not None:
         lines.append(f"市值: {mops['market_cap_100m']:.1f} 億元")
     if mops.get("revenue_100m") is not None:
-        label = mops.get("period", "近12月")
-        lines.append(f"營收 ({label}): {_fmt_100m(mops.get('revenue_100m'))}")
+        label = mops.get("period", "YTD")
+        yoy = mops.get("revenue_yoy_pct")
+        yoy_str = f"  YoY {_fmt_pct(yoy)}" if yoy is not None else ""
+        lines.append(f"營收 ({label}): {_fmt_100m(mops.get('revenue_100m'))}{yoy_str}")
     if mops.get("gross_margin_pct") is not None:
         lines.append(f"毛利率: {mops['gross_margin_pct']:.1f}%")
     if mops.get("net_income_100m") is not None:
