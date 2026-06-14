@@ -349,6 +349,8 @@ def _cpi_via_worldbank() -> dict:
 BAODAO_CO_ID = "5312"
 BAODAO_TICKER = f"{BAODAO_CO_ID}.TWO"  # Yahoo Finance OTC Taiwan ticker
 
+BAODAO_TICKER = f"{BAODAO_CO_ID}.TWO"  # Yahoo Finance OTC Taiwan ticker
+
 
 def fetch_mops_baodao() -> dict:
     result = {
