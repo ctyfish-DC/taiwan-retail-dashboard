@@ -39,7 +39,6 @@ def build_message(data: dict) -> str:
     # MOEA 整體零售業
     moea = data.get("moea", {})
     overall = moea.get("overall")
-    moea_error = moea.get("error")
 
     lines.append("【整體零售業】")
     if overall:
@@ -48,7 +47,7 @@ def build_message(data: dict) -> str:
         lines.append(f"YoY: {_fmt_pct(overall.get('yoy_pct'))}")
         lines.append(f"MoM: {_fmt_pct(overall.get('mom_pct'))}")
     else:
-        lines.append("⚠️ 暫時無法取得")
+        lines.append(f"⚠️ {moea.get('error') or '暫時無法取得'}")
     lines.append("")
 
     # CPI
@@ -148,22 +147,18 @@ def send_line_message(message: str, token: Optional[str] = None, user_id: Option
         return False
 
 
-# Keep old name as alias for main.py compatibility
-send_line_notify = send_line_message
-
-
 if __name__ == "__main__":
-    import json, sys
     logging.basicConfig(level=logging.INFO)
     sample_data = {
-        "fetched_at": "2026/06/08 08:00",
-        "moea": {
-            "overall": {"month": "2026年4月", "revenue_100m": 3842.5, "yoy_pct": 3.2, "mom_pct": -1.8},
-            "eyewear": {"month": "2026年4月", "revenue_100m": 28.6, "yoy_pct": 5.4},
-            "error": None,
+        "fetched_at": "2026/06/14 08:00",
+        "moea": {"overall": None, "error": "需台灣 IP，待自架 runner 後啟用"},
+        "cpi": {"month": "2025年（年均）", "cpi": None, "yoy_pct": 1.7, "error": None},
+        "mops": {
+            "close_price": 96.2, "price_change_pct": 0.9,
+            "week52_low": 92.6, "week52_high": 160.0, "market_cap_100m": 57.8,
+            "latest_q_label": "2025 Q4", "latest_q_revenue_100m": 3.8, "latest_q_yoy_pct": 5.2,
+            "period": "2025 Q1–Q4", "revenue_100m": 15.1, "revenue_yoy_pct": 4.0,
+            "gross_margin_pct": 63.7, "net_income_100m": 3.5, "error": None,
         },
-        "cpi": {"month": "2026年5月", "cpi": 107.35, "yoy_pct": 2.24, "error": None},
-        "mops": {"period": "2026Q1", "revenue_100m": 18.7, "net_income_100m": 1.3, "error": None},
     }
-    msg = build_message(sample_data)
-    print(msg)
+    print(build_message(sample_data))

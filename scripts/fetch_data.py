@@ -1,275 +1,35 @@
 """
 fetch_data.py
 Fetches Taiwan retail statistics from:
-  - MOEA 經濟部統計處: Overall retail monthly revenue (YoY/MoM)
-  - OECD API: Taiwan CPI (globally accessible, no IP restrictions)
-  - MOPS 公開資訊觀測站: 寶島光學科技 (5312) latest financial report
+  - CPI: IMF DataMapper API (fallback: World Bank) — annual YoY inflation
+  - 寶島光學科技 (5312, 上櫃): Yahoo Finance via yfinance
+
+MOEA 經濟部零售業數據：台灣政府網站（moea.gov.tw / data.gov.tw / mops.twse.com.tw）
+封鎖境外 IP，GitHub Actions（美國）無法抓取。待改用台灣 IP（自架 runner）後再啟用。
 """
 
-import re
-import io
 import logging
 from datetime import datetime
-from typing import Optional
 
 import requests
-import pandas as pd
-from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": "https://www.moea.gov.tw/",
-}
 
 # ─────────────────────────────────────────────
-# MOEA 經濟部統計處 — Retail Sales (Overall only)
+# MOEA 經濟部統計處 — 需要台灣 IP，暫停抓取
 # ─────────────────────────────────────────────
-
-def _make_moea_session() -> requests.Session:
-    """Establish a session on MOEA main page to bypass WAF."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.headers["Referer"] = "https://www.moea.gov.tw/"
-    try:
-        session.get("https://www.moea.gov.tw/", timeout=15)
-    except Exception:
-        pass
-    return session
-
 
 def fetch_moea_retail() -> dict:
-    result = {"overall": None, "error": None}
-
-    for attempt in (_moea_via_datagov_search, _moea_via_datagov_direct, _moea_via_hub):
-        try:
-            df = attempt()
-            if df is not None and not df.empty:
-                parsed = _parse_moea_overall(df)
-                if parsed is not None:
-                    result["overall"] = parsed
-                    logger.info("MOEA fetched via %s", attempt.__name__)
-                    return result
-                else:
-                    logger.warning("MOEA %s: DataFrame found but parse failed", attempt.__name__)
-        except Exception as exc:
-            logger.warning("MOEA %s failed: %s", attempt.__name__, exc)
-
-    result["error"] = "MOEA 資料暫時無法取得"
-    logger.warning("All MOEA fetch attempts failed")
-    return result
-
-
-def _moea_via_datagov_search() -> Optional[pd.DataFrame]:
-    """
-    Search data.gov.tw open data for 批發零售業 dataset and download CSV/Excel.
-    data.gov.tw is accessible from GitHub Actions (returns HTTP errors, not connection refused).
-    """
-    # Try multiple search terms
-    for keyword in ("批發零售", "零售業營業額", "零售"):
-        try:
-            url = f"https://data.gov.tw/api/v2/datasets?keyword={requests.utils.quote(keyword)}&size=10"
-            resp = requests.get(url, headers=HEADERS, timeout=20)
-            logger.warning("data.gov.tw search status: %d for keyword=%s", resp.status_code, keyword)
-            if resp.status_code != 200:
-                continue
-            body = resp.json()
-            # Handle both possible response structures
-            datasets = (
-                body.get("result", {}).get("results")
-                or body.get("results")
-                or []
-            )
-            for ds in datasets:
-                for res in ds.get("resources", []):
-                    dl_url = res.get("download_url", "") or res.get("url", "")
-                    if not dl_url:
-                        continue
-                    ext = dl_url.lower().split("?")[0].split(".")[-1]
-                    if ext not in ("csv", "xlsx", "xls"):
-                        continue
-                    try:
-                        r = requests.get(dl_url, headers=HEADERS, timeout=60)
-                        r.raise_for_status()
-                        if ext == "csv":
-                            df = _read_csv_bytes(r.content)
-                        else:
-                            df = pd.read_excel(io.BytesIO(r.content), header=None)
-                        if df is not None and not df.empty:
-                            logger.warning("data.gov.tw: got df from %s", dl_url)
-                            return df
-                    except Exception as exc:
-                        logger.warning("data.gov.tw download %s failed: %s", dl_url, exc)
-        except Exception as exc:
-            logger.warning("data.gov.tw search keyword=%s failed: %s", keyword, exc)
-    raise ValueError("No usable dataset from data.gov.tw search")
-
-
-def _moea_via_datagov_direct() -> Optional[pd.DataFrame]:
-    """
-    Try direct known data.gov.tw dataset resource URLs for MOEA retail stats.
-    Dataset IDs that have historically contained this data.
-    """
-    # These are candidate dataset IDs — try fetching their metadata to get download URLs
-    candidate_ids = ["6889", "25803", "10396"]
-    for dataset_id in candidate_ids:
-        try:
-            meta_url = f"https://data.gov.tw/api/v2/datasets/{dataset_id}"
-            resp = requests.get(meta_url, headers=HEADERS, timeout=15)
-            logger.warning("data.gov.tw dataset %s: HTTP %d", dataset_id, resp.status_code)
-            if resp.status_code != 200:
-                continue
-            resources = resp.json().get("result", {}).get("resources", [])
-            for res in resources:
-                dl_url = res.get("download_url", "")
-                if not dl_url:
-                    continue
-                ext = dl_url.lower().split("?")[0].split(".")[-1]
-                if ext not in ("csv", "xlsx", "xls"):
-                    continue
-                r = requests.get(dl_url, headers=HEADERS, timeout=60)
-                r.raise_for_status()
-                df = _read_csv_bytes(r.content) if ext == "csv" else pd.read_excel(io.BytesIO(r.content), header=None)
-                if df is not None and not df.empty:
-                    return df
-        except Exception as exc:
-            logger.warning("data.gov.tw dataset %s failed: %s", dataset_id, exc)
-    raise ValueError("No usable direct dataset from data.gov.tw")
-
-
-def _moea_via_hub() -> Optional[pd.DataFrame]:
-    """Scrape MOEA statistics pages for retail data, with session warmup."""
-    urls_to_try = [
-        "https://www.moea.gov.tw/Mns/dos/content/wHandMenuFile.ashx?mid=9861",
-        "https://www.moea.gov.tw/Mns/dos/content/Content.aspx?menu_id=9861",
-        "https://www.moea.gov.tw/Mns/dos/home/IndexLink.aspx?mid=9861",
-    ]
-    session = _make_moea_session()
-
-    for hub_url in urls_to_try:
-        try:
-            resp = session.get(hub_url, timeout=30, allow_redirects=True)
-            logger.warning("MOEA hub %s → HTTP %d, %d bytes", hub_url, resp.status_code, len(resp.content))
-            if resp.status_code != 200:
-                continue
-            resp.encoding = "utf-8"
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            links = soup.find_all("a", href=True)
-            logger.warning("MOEA hub: found %d links, first 3: %s",
-                           len(links),
-                           [a["href"] for a in links[:3]])
-
-            for a in links:
-                href = a["href"]
-                if not href.startswith("http"):
-                    href = "https://www.moea.gov.tw" + href
-                # Follow any link to find Excel/CSV
-                if href.endswith((".xlsx", ".xls")):
-                    r = session.get(href, timeout=60)
-                    r.raise_for_status()
-                    df = pd.read_excel(io.BytesIO(r.content), header=None)
-                    if df is not None and not df.empty:
-                        logger.warning("MOEA: downloaded Excel from %s", href)
-                        return df
-                elif href.endswith(".csv"):
-                    r = session.get(href, timeout=60)
-                    r.raise_for_status()
-                    df = _read_csv_bytes(r.content)
-                    if df is not None and not df.empty:
-                        return df
-                elif "dos" in href and any(kw in a.get_text() for kw in ("零售", "批發", "統計", "下載")):
-                    # Follow internal links that might lead to data
-                    try:
-                        r = session.get(href, timeout=20)
-                        r.encoding = "utf-8"
-                        sub = BeautifulSoup(r.text, "html.parser")
-                        for sub_a in sub.find_all("a", href=True):
-                            sub_href = sub_a["href"]
-                            if not sub_href.startswith("http"):
-                                sub_href = "https://www.moea.gov.tw" + sub_href
-                            if sub_href.endswith((".xlsx", ".xls")):
-                                r2 = session.get(sub_href, timeout=60)
-                                r2.raise_for_status()
-                                df = pd.read_excel(io.BytesIO(r2.content), header=None)
-                                if df is not None and not df.empty:
-                                    logger.warning("MOEA: found Excel via sub-link %s", sub_href)
-                                    return df
-                    except Exception:
-                        pass
-        except Exception as exc:
-            logger.warning("MOEA hub %s failed: %s", hub_url, exc)
-
-    raise ValueError("No Excel/CSV found on any MOEA hub page")
-
-
-def _read_csv_bytes(content: bytes) -> Optional[pd.DataFrame]:
-    for enc in ("utf-8-sig", "big5", "cp950", "utf-8"):
-        try:
-            return pd.read_csv(io.StringIO(content.decode(enc)))
-        except (UnicodeDecodeError, pd.errors.ParserError):
-            continue
-    return None
-
-
-def _parse_moea_overall(df: pd.DataFrame) -> Optional[dict]:
-    try:
-        df_str = df.astype(str)
-        mask = df_str.apply(lambda col: col.str.contains("零售業$", regex=True)).any(axis=1)
-        row = df[mask]
-        if row.empty:
-            row = df.iloc[[2]]
-        row = row.iloc[0]
-        values = pd.to_numeric(row, errors="coerce").dropna()
-        if len(values) < 2:
-            return None
-        rev_latest = float(values.iloc[-1])
-        rev_prev = float(values.iloc[-2])
-        mom = round((rev_latest - rev_prev) / rev_prev * 100, 1) if rev_prev else None
-        return {
-            "month": _guess_latest_month(df),
-            "revenue_100m": round(rev_latest / 100, 1),
-            "yoy_pct": None,
-            "mom_pct": mom,
-        }
-    except Exception as exc:
-        logger.debug("_parse_moea_overall failed: %s", exc)
-        return None
-
-
-def _guess_latest_month(df: pd.DataFrame) -> str:
-    for cell in df.values.flatten():
-        s = str(cell)
-        m = re.search(r"(\d{3})(\d{2})", s)
-        if m:
-            roc_year, month = int(m.group(1)), int(m.group(2))
-            if 1 <= month <= 12:
-                return f"{roc_year + 1911}年{month}月"
-        m = re.search(r"(\d{4})[年/](\d{1,2})月?", s)
-        if m:
-            return f"{m.group(1)}年{int(m.group(2))}月"
-    now = datetime.now()
-    month = now.month - 2 if now.month > 2 else now.month + 10
-    year = now.year if now.month > 2 else now.year - 1
-    return f"{year}年{month}月"
+    logger.info("MOEA 零售業數據需台灣 IP，暫不抓取（等自架 runner）")
+    return {"overall": None, "error": "需台灣 IP，待自架 runner 後啟用"}
 
 
 # ─────────────────────────────────────────────
-# CPI — OECD API (globally accessible)
+# CPI — IMF DataMapper（全球可用），備援 World Bank
 # ─────────────────────────────────────────────
 
 def fetch_cpi() -> dict:
-    """
-    Fetch Taiwan CPI from IMF DataMapper API — globally accessible, includes Taiwan.
-    Falls back to World Bank API.
-    """
     result = {"month": None, "cpi": None, "yoy_pct": None, "error": None}
 
     for attempt in (_cpi_via_imf, _cpi_via_worldbank):
@@ -288,40 +48,30 @@ def fetch_cpi() -> dict:
 
 
 def _cpi_via_imf() -> dict:
-    """
-    IMF DataMapper API — PCPIPCH = CPI annual % change for Taiwan (TWN).
-    Returns latest available annual YoY inflation rate.
-    Free, no auth, globally accessible.
-    """
+    """PCPIPCH = CPI annual % change for Taiwan (TWN). Free, no auth."""
     url = "https://www.imf.org/external/datamapper/api/v1/PCPIPCH/TWN"
     resp = requests.get(url, timeout=20)
     resp.raise_for_status()
-    data = resp.json()
-
-    values = data.get("values", {}).get("PCPIPCH", {}).get("TWN", {})
+    values = resp.json().get("values", {}).get("PCPIPCH", {}).get("TWN", {})
     if not values:
         raise ValueError("No IMF PCPIPCH data for TWN")
 
-    # Filter out future forecasts — only use confirmed historical years
+    # IMF includes forecast years — only use confirmed historical years
     current_year = datetime.now().year
     historical = {y: v for y, v in values.items() if int(y) < current_year and v is not None}
     if not historical:
         raise ValueError("No historical IMF data for TWN")
 
     latest_year = max(historical.keys(), key=lambda y: int(y))
-    yoy = round(float(historical[latest_year]), 2)
-
     return {
         "month": f"{latest_year}年（年均）",
         "cpi": None,
-        "yoy_pct": yoy,
+        "yoy_pct": round(float(historical[latest_year]), 2),
     }
 
 
 def _cpi_via_worldbank() -> dict:
-    """
-    World Bank API — FP.CPI.TOTL.ZG = CPI annual % change for Taiwan (TW).
-    """
+    """FP.CPI.TOTL.ZG = CPI annual % change for Taiwan (TW)."""
     url = (
         "https://api.worldbank.org/v2/country/TW/indicator/FP.CPI.TOTL.ZG"
         "?format=json&mrv=3&per_page=3"
@@ -332,12 +82,10 @@ def _cpi_via_worldbank() -> dict:
     records = body[1] if len(body) > 1 else []
     for rec in records:
         if rec.get("value") is not None:
-            yoy = round(float(rec["value"]), 2)
-            year = rec.get("date", "")
             return {
-                "month": f"{year}年（年均）",
+                "month": f"{rec.get('date', '')}年（年均）",
                 "cpi": None,
-                "yoy_pct": yoy,
+                "yoy_pct": round(float(rec["value"]), 2),
             }
     raise ValueError("No World Bank CPI data")
 
@@ -349,13 +97,15 @@ def _cpi_via_worldbank() -> dict:
 BAODAO_CO_ID = "5312"
 BAODAO_TICKER = f"{BAODAO_CO_ID}.TWO"  # Yahoo Finance OTC Taiwan ticker
 
-BAODAO_TICKER = f"{BAODAO_CO_ID}.TWO"  # Yahoo Finance OTC Taiwan ticker
 
-
-def fetch_mops_baodao() -> dict:
+def fetch_baodao() -> dict:
     result = {
         "period": None,
         "revenue_100m": None,
+        "revenue_yoy_pct": None,
+        "latest_q_label": None,
+        "latest_q_revenue_100m": None,
+        "latest_q_yoy_pct": None,
         "gross_margin_pct": None,
         "net_income_100m": None,
         "close_price": None,
@@ -363,21 +113,15 @@ def fetch_mops_baodao() -> dict:
         "week52_high": None,
         "week52_low": None,
         "market_cap_100m": None,
-        "revenue_yoy_pct": None,
-        "latest_q_label": None,
-        "latest_q_revenue_100m": None,
-        "latest_q_yoy_pct": None,
         "error": None,
     }
 
     try:
         import yfinance as yf
         ticker = yf.Ticker(BAODAO_TICKER)
-
-        # 股價資訊
         info = ticker.info
-        logger.warning("yfinance info keys sample: %s", list(info.keys())[:10])
 
+        # 股價
         result["close_price"] = info.get("currentPrice") or info.get("regularMarketPrice")
         result["week52_high"] = info.get("fiftyTwoWeekHigh")
         result["week52_low"] = info.get("fiftyTwoWeekLow")
@@ -392,7 +136,7 @@ def fetch_mops_baodao() -> dict:
                 (result["close_price"] - prev_close) / prev_close * 100, 2
             )
 
-        # 財務數據
+        # 財務
         gross_margins = info.get("grossMargins")
         if gross_margins is not None:
             result["gross_margin_pct"] = round(gross_margins * 100, 1)
@@ -401,8 +145,7 @@ def fetch_mops_baodao() -> dict:
         if net_income:
             result["net_income_100m"] = round(net_income / 100_000_000, 2)
 
-        # YTD 累計營收 + YoY（從季報加總）
-        _calc_ytd_revenue(ticker, result)
+        _calc_revenue(ticker, result)
 
         if result["close_price"]:
             logger.info("寶島 5312 yfinance OK: price=%s", result["close_price"])
@@ -416,8 +159,8 @@ def fetch_mops_baodao() -> dict:
     return result
 
 
-def _calc_ytd_revenue(ticker, result: dict) -> None:
-    """從季報取最新季 + 全年累計，並計算 YoY%。"""
+def _calc_revenue(ticker, result: dict) -> None:
+    """從季報取最新單季與年度累計營收，各附去年同期 YoY%。"""
     try:
         stmt = ticker.quarterly_income_stmt
         if stmt is None or stmt.empty:
@@ -428,7 +171,7 @@ def _calc_ytd_revenue(ticker, result: dict) -> None:
 
         revenue_row = None
         for idx in stmt.index:
-            if "revenue" in str(idx).lower() or "total revenue" in str(idx).lower():
+            if "revenue" in str(idx).lower():
                 revenue_row = stmt.loc[idx]
                 break
         if revenue_row is None:
@@ -436,64 +179,56 @@ def _calc_ytd_revenue(ticker, result: dict) -> None:
             return
 
         revenue_row = revenue_row.dropna().sort_index(ascending=False)
-        logger.warning("yfinance quarterly revenue dates: %s", list(revenue_row.index))
-
-        now = datetime.now()
-        current_year = now.year
+        logger.info("yfinance quarterly revenue dates: %s",
+                    [d.strftime("%Y-%m-%d") for d in revenue_row.index])
 
         by_year: dict = {}
         for d, v in revenue_row.items():
             by_year.setdefault(d.year, []).append((d, v))
-
-        # Find the most recent year with data
-        data_years = sorted(by_year.keys(), reverse=True)
-        if not data_years:
+        if not by_year:
             return
 
-        latest_year = data_years[0]
-        # If current year has no data, use latest available
-        if latest_year < current_year:
-            label_note = f"（{current_year} Q1 資料待更新）"
-        else:
-            label_note = ""
+        current_year = datetime.now().year
+        latest_year = max(by_year.keys())
+        # Yahoo Finance 對小型上櫃股的季報更新較慢，可能落後一季以上
+        label_note = f"（{current_year} 年資料待 Yahoo 更新）" if latest_year < current_year else ""
 
         latest_quarters = sorted(by_year[latest_year], reverse=True)  # newest first
-        prev_year = latest_year - 1
-        prev_quarters = sorted(by_year.get(prev_year, []), reverse=True)
+        prev_quarters = sorted(by_year.get(latest_year - 1, []), reverse=True)
 
-        # Most recent single quarter + YoY
+        # 最新單季 + 去年同季 YoY
         latest_q_date, latest_q_val = latest_quarters[0]
         q_num = (latest_q_date.month + 2) // 3
         result["latest_q_label"] = f"{latest_year} Q{q_num}"
         result["latest_q_revenue_100m"] = round(latest_q_val / 100_000_000, 2)
 
-        # Same quarter prior year
         same_q_prev = [v for d, v in prev_quarters if (d.month + 2) // 3 == q_num]
-        if same_q_prev:
-            prev_val = same_q_prev[0]
-            result["latest_q_yoy_pct"] = round((latest_q_val - prev_val) / prev_val * 100, 1)
+        if same_q_prev and same_q_prev[0]:
+            result["latest_q_yoy_pct"] = round(
+                (latest_q_val - same_q_prev[0]) / same_q_prev[0] * 100, 1
+            )
 
-        # Full year cumulative (all quarters of latest_year)
+        # 年度累計 + 去年同期 YoY
         year_total = sum(v for _, v in latest_quarters)
         n_q = len(latest_quarters)
         result["revenue_100m"] = round(year_total / 100_000_000, 2)
         result["period"] = f"{latest_year} Q1–Q{n_q}{label_note}"
 
-        # YoY for same n quarters of prev year
         same_n_prev_vals = [v for _, v in prev_quarters[:n_q]]
         if len(same_n_prev_vals) == n_q:
             prev_total = sum(same_n_prev_vals)
             if prev_total:
                 result["revenue_yoy_pct"] = round((year_total - prev_total) / prev_total * 100, 1)
 
-        logger.info("Revenue: latest_q=%s %.2f億 YoY=%s%%, full=%s %.2f億 YoY=%s%%",
-                    result.get("latest_q_label"), result.get("latest_q_revenue_100m"),
-                    result.get("latest_q_yoy_pct"),
-                    result["period"], result["revenue_100m"],
-                    result.get("revenue_yoy_pct"))
+        logger.info(
+            "Revenue: latest_q=%s %.2f億 YoY=%s%%, cum=%s %.2f億 YoY=%s%%",
+            result["latest_q_label"], result["latest_q_revenue_100m"],
+            result["latest_q_yoy_pct"],
+            result["period"], result["revenue_100m"], result["revenue_yoy_pct"],
+        )
 
     except Exception as exc:
-        logger.warning("YTD revenue calc failed: %s", exc)
+        logger.warning("Revenue calc failed: %s", exc)
 
 
 # ─────────────────────────────────────────────
@@ -501,14 +236,13 @@ def _calc_ytd_revenue(ticker, result: dict) -> None:
 # ─────────────────────────────────────────────
 
 def fetch_all() -> dict:
-    logger.info("Fetching MOEA retail data…")
     moea = fetch_moea_retail()
 
-    logger.info("Fetching CPI data (OECD API)…")
+    logger.info("Fetching CPI (IMF API)…")
     cpi = fetch_cpi()
 
-    logger.info("Fetching MOPS 寶島光學科技 (5312) data…")
-    mops = fetch_mops_baodao()
+    logger.info("Fetching 寶島光學科技 (5312) via Yahoo Finance…")
+    mops = fetch_baodao()
 
     return {
         "moea": moea,
@@ -521,5 +255,4 @@ def fetch_all() -> dict:
 if __name__ == "__main__":
     import json
     logging.basicConfig(level=logging.INFO)
-    data = fetch_all()
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    print(json.dumps(fetch_all(), ensure_ascii=False, indent=2))
