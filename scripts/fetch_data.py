@@ -105,22 +105,21 @@ def fetch_stock(name: str, yahoo_ticker: str) -> dict:
     result = {
         "name": name,
         "co_id": yahoo_ticker.split(".")[0],
-        "period": None,
-        "revenue_100m": None,
-        "revenue_yoy_pct": None,
-        "latest_q_label": None,
-        "latest_q_revenue_100m": None,
-        "latest_q_yoy_pct": None,
+        "quarters": [],            # 近四個完整季度（舊→新）: {label, revenue_100m, yoy_pct}
+        "ytd_label": None,         # 今年累計
+        "ytd_revenue_100m": None,
+        "ytd_yoy_pct": None,
+        "revenue_source": None,
         "gross_margin_pct": None,
         "net_income_100m": None,
         "close_price": None,
         "price_change_pct": None,
-        "week52_high": None,
-        "week52_low": None,
         "market_cap_100m": None,
         "error": None,
     }
 
+    # ── 股價 / 估值 / 獲利率：yfinance ──
+    ticker = None
     try:
         import yfinance as yf
         ticker = yf.Ticker(yahoo_ticker)
@@ -134,10 +133,7 @@ def fetch_stock(name: str, yahoo_ticker: str) -> dict:
             ticker = yf.Ticker(alt)
             info = ticker.info
 
-        # 股價
         result["close_price"] = info.get("currentPrice") or info.get("regularMarketPrice")
-        result["week52_high"] = info.get("fiftyTwoWeekHigh")
-        result["week52_low"] = info.get("fiftyTwoWeekLow")
 
         market_cap = info.get("marketCap")
         if market_cap:
@@ -149,7 +145,6 @@ def fetch_stock(name: str, yahoo_ticker: str) -> dict:
                 (result["close_price"] - prev_close) / prev_close * 100, 2
             )
 
-        # 財務
         gross_margins = info.get("grossMargins")
         if gross_margins is not None:
             result["gross_margin_pct"] = round(gross_margins * 100, 1)
@@ -157,8 +152,6 @@ def fetch_stock(name: str, yahoo_ticker: str) -> dict:
         net_income = info.get("netIncomeToCommon")
         if net_income:
             result["net_income_100m"] = round(net_income / 100_000_000, 2)
-
-        _calc_revenue(ticker, result)
 
         if result["close_price"]:
             logger.info("%s yfinance OK: price=%s", name, result["close_price"])
@@ -169,11 +162,108 @@ def fetch_stock(name: str, yahoo_ticker: str) -> dict:
         logger.warning("%s yfinance failed: %s", name, exc)
         result["error"] = str(exc)
 
+    # ── 營收：優先 FinMind（MOPS 月營收鏡像，最新），失敗才退回 Yahoo 季報 ──
+    try:
+        months = _monthly_revenue_finmind(result["co_id"])
+        quarters, ytd = _quarters_from_monthly(months)
+        if quarters:
+            result["quarters"] = quarters
+            result["revenue_source"] = "MOPS月營收(FinMind)"
+        if ytd:
+            result["ytd_label"] = ytd["label"]
+            result["ytd_revenue_100m"] = ytd["revenue_100m"]
+            result["ytd_yoy_pct"] = ytd["yoy_pct"]
+        logger.info("%s FinMind revenue OK: %d quarters, ytd=%s",
+                    name, len(quarters), ytd and ytd["label"])
+    except Exception as exc:
+        logger.warning("%s FinMind failed (%s), falling back to Yahoo quarterly", name, exc)
+        if ticker is not None:
+            _revenue_from_yfinance(ticker, result)
+
     return result
 
 
-def _calc_revenue(ticker, result: dict) -> None:
-    """從季報取最新單季與年度累計營收，各附去年同期 YoY%。"""
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+
+
+def _monthly_revenue_finmind(co_id: str) -> dict:
+    """月營收 {(year, month): revenue_元}。來源為 MOPS 公開資訊觀測站，經 FinMind 鏡像
+    （台灣政府網站封鎖境外 IP，FinMind 的 API 全球可用）。"""
+    start = f"{datetime.now().year - 2}-01-01"
+    resp = requests.get(
+        FINMIND_URL,
+        params={
+            "dataset": "TaiwanStockMonthRevenue",
+            "data_id": co_id,
+            "start_date": start,
+        },
+        timeout=25,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    rows = body.get("data") or []
+    months = {}
+    for r in rows:
+        y, m, v = r.get("revenue_year"), r.get("revenue_month"), r.get("revenue")
+        if y and m and v:
+            months[(int(y), int(m))] = float(v)
+    if not months:
+        raise ValueError(f"no monthly revenue rows (msg={body.get('msg')})")
+
+    # 單位防呆：MOPS 原始為千元、FinMind 通常已轉為元；數值過小視為千元
+    vals = sorted(months.values())
+    median = vals[len(vals) // 2]
+    if median < 1e7:
+        months = {k: v * 1000 for k, v in months.items()}
+        logger.info("FinMind %s: values look like 千元, scaled x1000", co_id)
+    return months
+
+
+def _quarters_from_monthly(months: dict):
+    """由月營收組出最近 4 個完整季度與今年累計，各附去年同期 YoY%。"""
+
+    def q_rev(y: int, q: int):
+        ms = [(y, q * 3 - 2), (y, q * 3 - 1), (y, q * 3)]
+        if all(m in months for m in ms):
+            return sum(months[m] for m in ms)
+        return None
+
+    complete = []
+    for y in sorted({y for y, _ in months}):
+        for q in (1, 2, 3, 4):
+            v = q_rev(y, q)
+            if v is not None:
+                complete.append((y, q, v))
+
+    quarters = []
+    for y, q, v in complete[-4:]:
+        prev = q_rev(y - 1, q)
+        quarters.append({
+            "label": f"{y} Q{q}",
+            "revenue_100m": round(v / 1e8, 2),
+            "yoy_pct": round((v - prev) / prev * 100, 1) if prev else None,
+        })
+
+    now = datetime.now()
+    cur_months = sorted(m for (y, m) in months if y == now.year)
+    ytd = None
+    if cur_months:
+        cur_sum = sum(months[(now.year, m)] for m in cur_months)
+        ytd = {
+            "label": f"{now.year}/1–{max(cur_months)}月",
+            "revenue_100m": round(cur_sum / 1e8, 2),
+            "yoy_pct": None,
+        }
+        if all((now.year - 1, m) in months for m in cur_months):
+            prev_sum = sum(months[(now.year - 1, m)] for m in cur_months)
+            if prev_sum:
+                ytd["yoy_pct"] = round((cur_sum - prev_sum) / prev_sum * 100, 1)
+
+    return quarters, ytd
+
+
+def _revenue_from_yfinance(ticker, result: dict) -> None:
+    """備援：Yahoo 季報。台股中小型股更新較慢，資料可能落後（標注於 label）。"""
     try:
         stmt = ticker.quarterly_income_stmt
         if stmt is None or stmt.empty:
@@ -188,60 +278,32 @@ def _calc_revenue(ticker, result: dict) -> None:
                 revenue_row = stmt.loc[idx]
                 break
         if revenue_row is None:
-            logger.warning("yfinance: revenue row not found, index=%s", list(stmt.index)[:5])
             return
 
-        revenue_row = revenue_row.dropna().sort_index(ascending=False)
-        logger.info("yfinance quarterly revenue dates: %s",
-                    [d.strftime("%Y-%m-%d") for d in revenue_row.index])
-
-        by_year: dict = {}
-        for d, v in revenue_row.items():
-            by_year.setdefault(d.year, []).append((d, v))
-        if not by_year:
+        revenue_row = revenue_row.dropna().sort_index()  # 舊→新
+        items = [(d, v) for d, v in revenue_row.items()]
+        if not items:
             return
 
-        current_year = datetime.now().year
-        latest_year = max(by_year.keys())
-        # Yahoo Finance 對小型上櫃股的季報更新較慢，可能落後一季以上
-        label_note = f"（{current_year} 年資料待 Yahoo 更新）" if latest_year < current_year else ""
+        rev_by_q = {(d.year, (d.month + 2) // 3): v for d, v in items}
+        quarters = []
+        for (y, q), v in sorted(rev_by_q.items())[-4:]:
+            prev = rev_by_q.get((y - 1, q))
+            quarters.append({
+                "label": f"{y} Q{q}",
+                "revenue_100m": round(v / 1e8, 2),
+                "yoy_pct": round((v - prev) / prev * 100, 1) if prev else None,
+            })
+        result["quarters"] = quarters
+        result["revenue_source"] = "Yahoo季報(可能落後)"
 
-        latest_quarters = sorted(by_year[latest_year], reverse=True)  # newest first
-        prev_quarters = sorted(by_year.get(latest_year - 1, []), reverse=True)
-
-        # 最新單季 + 去年同季 YoY
-        latest_q_date, latest_q_val = latest_quarters[0]
-        q_num = (latest_q_date.month + 2) // 3
-        result["latest_q_label"] = f"{latest_year} Q{q_num}"
-        result["latest_q_revenue_100m"] = round(latest_q_val / 100_000_000, 2)
-
-        same_q_prev = [v for d, v in prev_quarters if (d.month + 2) // 3 == q_num]
-        if same_q_prev and same_q_prev[0]:
-            result["latest_q_yoy_pct"] = round(
-                (latest_q_val - same_q_prev[0]) / same_q_prev[0] * 100, 1
-            )
-
-        # 年度累計 + 去年同期 YoY
-        year_total = sum(v for _, v in latest_quarters)
-        n_q = len(latest_quarters)
-        result["revenue_100m"] = round(year_total / 100_000_000, 2)
-        result["period"] = f"{latest_year} Q1–Q{n_q}{label_note}"
-
-        same_n_prev_vals = [v for _, v in prev_quarters[:n_q]]
-        if len(same_n_prev_vals) == n_q:
-            prev_total = sum(same_n_prev_vals)
-            if prev_total:
-                result["revenue_yoy_pct"] = round((year_total - prev_total) / prev_total * 100, 1)
-
-        logger.info(
-            "Revenue: latest_q=%s %.2f億 YoY=%s%%, cum=%s %.2f億 YoY=%s%%",
-            result["latest_q_label"], result["latest_q_revenue_100m"],
-            result["latest_q_yoy_pct"],
-            result["period"], result["revenue_100m"], result["revenue_yoy_pct"],
-        )
-
+        latest_year = max(y for y, _ in rev_by_q)
+        year_qs = [(q, v) for (y, q), v in rev_by_q.items() if y == latest_year]
+        year_total = sum(v for _, v in year_qs)
+        result["ytd_label"] = f"{latest_year} Q1–Q{len(year_qs)}"
+        result["ytd_revenue_100m"] = round(year_total / 1e8, 2)
     except Exception as exc:
-        logger.warning("Revenue calc failed: %s", exc)
+        logger.warning("yfinance revenue fallback failed: %s", exc)
 
 
 # ─────────────────────────────────────────────

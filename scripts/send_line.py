@@ -72,30 +72,34 @@ def build_message(data: dict) -> str:
             chg = stock.get("price_change_pct")
             chg_str = f"（{_fmt_pct(chg)}）" if chg is not None else ""
             lines.append(f"股價: {stock['close_price']:.1f} 元 {chg_str}".strip())
-        if stock.get("week52_high") is not None:
-            lines.append(f"52週: {stock['week52_low']:.1f} – {stock['week52_high']:.1f} 元")
         if stock.get("market_cap_100m") is not None:
             lines.append(f"市值: {stock['market_cap_100m']:.1f} 億元")
-        if stock.get("latest_q_label") is not None:
-            q_yoy = stock.get("latest_q_yoy_pct")
-            q_yoy_str = f"  YoY {_fmt_pct(q_yoy)}" if q_yoy is not None else ""
-            lines.append(f"營收 ({stock['latest_q_label']}): {_fmt_100m(stock.get('latest_q_revenue_100m'))}{q_yoy_str}")
-        if stock.get("revenue_100m") is not None:
-            label = stock.get("period", "累計")
-            yoy = stock.get("revenue_yoy_pct")
+
+        quarters = stock.get("quarters") or []
+        if quarters:
+            src = stock.get("revenue_source")
+            src_str = f"（{src}）" if src else ""
+            lines.append(f"近四季營收{src_str}:")
+            for q in quarters:
+                yoy = q.get("yoy_pct")
+                yoy_str = f"  YoY {_fmt_pct(yoy)}" if yoy is not None else ""
+                lines.append(f"· {q['label']}: {_fmt_100m(q.get('revenue_100m'))}{yoy_str}")
+        if stock.get("ytd_revenue_100m") is not None:
+            yoy = stock.get("ytd_yoy_pct")
             yoy_str = f"  YoY {_fmt_pct(yoy)}" if yoy is not None else ""
-            lines.append(f"累計營收 ({label}): {_fmt_100m(stock.get('revenue_100m'))}{yoy_str}")
+            lines.append(f"今年累計 ({stock.get('ytd_label')}): {_fmt_100m(stock.get('ytd_revenue_100m'))}{yoy_str}")
+
         if stock.get("gross_margin_pct") is not None:
             lines.append(f"毛利率: {stock['gross_margin_pct']:.1f}%")
         if stock.get("net_income_100m") is not None:
             lines.append(f"稅後淨利: {_fmt_100m(stock.get('net_income_100m'))}")
 
-        if stock.get("close_price") is None and stock.get("revenue_100m") is None:
+        if stock.get("close_price") is None and not quarters:
             lines.append("暫無資料")
         lines.append("")
 
     lines.append("─────────────────")
-    lines.append("資料來源: 經濟部統計處 / 主計總處 / Yahoo Finance")
+    lines.append("資料來源: 主計總處 / MOPS(FinMind) / Yahoo Finance")
 
     return "\n".join(lines)
 
@@ -156,19 +160,16 @@ if __name__ == "__main__":
         "stocks": [
             {
                 "name": "寶島光學科技", "co_id": "5312",
-                "close_price": 96.2, "price_change_pct": 0.9,
-                "week52_low": 92.6, "week52_high": 160.0, "market_cap_100m": 57.8,
-                "latest_q_label": "2025 Q4", "latest_q_revenue_100m": 3.8, "latest_q_yoy_pct": 5.2,
-                "period": "2025 Q1–Q4", "revenue_100m": 15.1, "revenue_yoy_pct": 4.0,
+                "close_price": 88.8, "price_change_pct": -1.3, "market_cap_100m": 53.3,
+                "revenue_source": "MOPS月營收(FinMind)",
+                "quarters": [
+                    {"label": "2025 Q3", "revenue_100m": 3.7, "yoy_pct": 8.0},
+                    {"label": "2025 Q4", "revenue_100m": 4.2, "yoy_pct": 22.7},
+                    {"label": "2026 Q1", "revenue_100m": 3.9, "yoy_pct": 6.1},
+                    {"label": "2026 Q2", "revenue_100m": 4.1, "yoy_pct": 5.4},
+                ],
+                "ytd_label": "2026/1–6月", "ytd_revenue_100m": 8.0, "ytd_yoy_pct": 5.7,
                 "gross_margin_pct": 63.7, "net_income_100m": 3.5, "error": None,
-            },
-            {
-                "name": "寶利徠光學科技", "co_id": "1813",
-                "close_price": 30.0, "price_change_pct": -1.2,
-                "week52_low": 25.0, "week52_high": 40.0, "market_cap_100m": 20.0,
-                "latest_q_label": "2025 Q4", "latest_q_revenue_100m": 1.0, "latest_q_yoy_pct": 3.0,
-                "period": "2025 Q1–Q4", "revenue_100m": 4.0, "revenue_yoy_pct": 2.0,
-                "gross_margin_pct": 50.0, "net_income_100m": 0.5, "error": None,
             },
         ],
     }
