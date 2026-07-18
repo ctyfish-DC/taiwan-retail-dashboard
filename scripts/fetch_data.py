@@ -2,7 +2,7 @@
 fetch_data.py
 Fetches Taiwan retail statistics from:
   - CPI: IMF DataMapper API (fallback: World Bank) — annual YoY inflation
-  - 寶島光學科技 (5312, 上櫃): Yahoo Finance via yfinance
+  - 個股營運（寶島光學 5312、寶利徠 1813）: Yahoo Finance via yfinance
 
 MOEA 經濟部零售業數據：台灣政府網站（moea.gov.tw / data.gov.tw / mops.twse.com.tw）
 封鎖境外 IP，GitHub Actions（美國）無法抓取。待改用台灣 IP（自架 runner）後再啟用。
@@ -91,15 +91,20 @@ def _cpi_via_worldbank() -> dict:
 
 
 # ─────────────────────────────────────────────
-# 寶島光學科技 (5312, 上櫃) — yfinance
+# 個股營運狀況 — yfinance
 # ─────────────────────────────────────────────
 
-BAODAO_CO_ID = "5312"
-BAODAO_TICKER = f"{BAODAO_CO_ID}.TWO"  # Yahoo Finance OTC Taiwan ticker
+# 追蹤的公司清單：.TWO = 上櫃、.TW = 上市（Yahoo Finance 代號後綴）
+COMPANIES = [
+    {"co_id": "5312", "name": "寶島光學科技", "ticker": "5312.TWO"},
+    {"co_id": "1813", "name": "寶利徠光學科技", "ticker": "1813.TW"},
+]
 
 
-def fetch_baodao() -> dict:
+def fetch_stock(name: str, yahoo_ticker: str) -> dict:
     result = {
+        "name": name,
+        "co_id": yahoo_ticker.split(".")[0],
         "period": None,
         "revenue_100m": None,
         "revenue_yoy_pct": None,
@@ -118,8 +123,16 @@ def fetch_baodao() -> dict:
 
     try:
         import yfinance as yf
-        ticker = yf.Ticker(BAODAO_TICKER)
+        ticker = yf.Ticker(yahoo_ticker)
         info = ticker.info
+
+        # 上市/上櫃後綴猜錯時換另一個再試
+        if not (info.get("currentPrice") or info.get("regularMarketPrice")):
+            base, suffix = yahoo_ticker.split(".")
+            alt = f"{base}.{'TW' if suffix == 'TWO' else 'TWO'}"
+            logger.warning("%s: no price for %s, retrying %s", name, yahoo_ticker, alt)
+            ticker = yf.Ticker(alt)
+            info = ticker.info
 
         # 股價
         result["close_price"] = info.get("currentPrice") or info.get("regularMarketPrice")
@@ -148,12 +161,12 @@ def fetch_baodao() -> dict:
         _calc_revenue(ticker, result)
 
         if result["close_price"]:
-            logger.info("寶島 5312 yfinance OK: price=%s", result["close_price"])
+            logger.info("%s yfinance OK: price=%s", name, result["close_price"])
         else:
-            logger.warning("寶島 5312: price not found in yfinance info")
+            logger.warning("%s: price not found in yfinance info", name)
 
     except Exception as exc:
-        logger.warning("yfinance failed: %s", exc)
+        logger.warning("%s yfinance failed: %s", name, exc)
         result["error"] = str(exc)
 
     return result
@@ -241,13 +254,15 @@ def fetch_all() -> dict:
     logger.info("Fetching CPI (IMF API)…")
     cpi = fetch_cpi()
 
-    logger.info("Fetching 寶島光學科技 (5312) via Yahoo Finance…")
-    mops = fetch_baodao()
+    stocks = []
+    for c in COMPANIES:
+        logger.info("Fetching %s (%s) via Yahoo Finance…", c["name"], c["co_id"])
+        stocks.append(fetch_stock(c["name"], c["ticker"]))
 
     return {
         "moea": moea,
         "cpi": cpi,
-        "mops": mops,
+        "stocks": stocks,
         "fetched_at": datetime.now().strftime("%Y/%m/%d %H:%M"),
     }
 
