@@ -1,6 +1,7 @@
 """
 main.py
-Orchestrates data fetching and LINE push for Taiwan retail weekly report.
+Orchestrates data fetching and LINE push for the Taiwan retail stocks
+monthly report (寶島光學 5312、寶利徠 1813 月營收 + CPI).
 
 Required environment variables:
     LINE_TOKEN    — LINE channel access token
@@ -26,7 +27,7 @@ def main() -> int:
         logger.error("Import error: %s", exc)
         return 1
 
-    logger.info("=== Taiwan Retail Weekly Notify — starting ===")
+    logger.info("=== Taiwan Retail Stocks Monthly Notify — starting ===")
 
     data = fetch_all()
     logger.info("Data fetch complete.")

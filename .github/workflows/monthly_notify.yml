@@ -1,9 +1,10 @@
-name: Taiwan Retail Weekly LINE Notify
+name: Taiwan Retail Stocks Monthly LINE Notify
 
 on:
   schedule:
-    # Every Monday at 00:00 UTC = Monday 08:00 Taiwan time (UTC+8)
-    - cron: "0 0 * * 1"
+    # 每月 11 日 09:00 台灣時間（UTC+8）= 01:00 UTC
+    # 台灣上市/上櫃公司依規定須於次月 10 日前公告月營收，11 日抓取確保資料已公告
+    - cron: "0 1 11 * *"
   workflow_dispatch:
 
 env:
@@ -27,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run weekly notify
+      - name: Run monthly notify
         env:
           LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
