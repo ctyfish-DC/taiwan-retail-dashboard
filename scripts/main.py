@@ -1,7 +1,7 @@
 """
 main.py
 Orchestrates data fetching and LINE push for the Taiwan retail stocks
-monthly report (寶島光學 5312、寶利徠 1813 月營收 + CPI).
+monthly report (寶島光學 5312、寶利徠 1813 月營收).
 
 Required environment variables:
     LINE_TOKEN    — LINE channel access token
