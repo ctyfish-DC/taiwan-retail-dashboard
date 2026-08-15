@@ -1,0 +1,36 @@
+name: TAIEX Daily Technical Analysis LINE Notify
+
+on:
+  schedule:
+    # 每個交易日 15:00 台灣時間（UTC+8）= 07:00 UTC，台股 13:30 收盤後留緩衝
+    # 週一 ~ 週五固定執行；國定假日當天沒有新收盤價，會顯示上一個交易日的資料
+    - cron: "0 7 * * 1-5"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  notify:
+    name: Fetch TAIEX indicators and send LINE message
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run TAIEX daily notify
+        env:
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: python scripts/taiex_notify.py
+        working-directory: ${{ github.workspace }}
