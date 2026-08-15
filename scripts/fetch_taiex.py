@@ -8,6 +8,10 @@ All indicator formulas are implemented directly with pandas/numpy
 (no TA-Lib / pandas-ta dependency) to avoid CI installation issues
 (TA-Lib needs a compiled C library) and third-party maintenance risk
 (pandas-ta's upstream project is heading toward being archived).
+
+也提供「情境觀察」(scenarios)：條件式的「若跌破/站上某關鍵價位，技術面
+意義為何」句子（例如跌破月線=短期轉弱訊號），純粹是規則生成的假設性
+說明，不是價格預測，也不涉及任何 AI 或外部模型。
 """
 
 import logging
@@ -134,6 +138,18 @@ def _ma_alignment(ma5, ma20, ma60):
     return "糾結整理"
 
 
+def _recent_high_low(high: pd.Series, low: pd.Series, n: int = 20):
+    """近 n 個交易日的最高/最低價，不含最新一筆（今天），
+    這樣「若突破/跌破」的情境句才是指向一個尚未觸及的價位。"""
+    hist_high, hist_low = high.iloc[:-1], low.iloc[:-1]
+    if hist_high.empty:
+        return None, None
+    return (
+        round(float(hist_high.iloc[-n:].max()), 1),
+        round(float(hist_low.iloc[-n:].min()), 1),
+    )
+
+
 def _build_narrative(ind: dict) -> str:
     """組一句規則式技術面摘要，完全由上面算出的數字/門檻決定，不呼叫任何 AI。"""
     bits = []
@@ -169,6 +185,64 @@ def _build_narrative(ind: dict) -> str:
     return "、".join(bits)
 
 
+def _build_scenarios(t: dict) -> list:
+    """產生「若觸及某關鍵價位，技術面意義為何」的條件式情境句。
+
+    這不是預測漲跌，而是列出：目前站在哪個關鍵價位的哪一側、
+    以及若價格「跨過」該價位在技術分析上通常代表的意義。
+    全部由已算出的均線/近期高低/指標數值與固定規則生成，不涉及任何預測模型。
+    """
+    close = t.get("close")
+    scenarios = []
+    if close is None:
+        return scenarios
+
+    ma20 = t.get("ma20")
+    if ma20 is not None:
+        if close >= ma20:
+            scenarios.append(f"目前站上月線（MA20 {ma20:,.0f}），若拉回跌破，短期轉弱訊號浮現")
+        else:
+            scenarios.append(f"目前跌破月線（MA20 {ma20:,.0f}），若站回其上，短期轉強訊號浮現")
+
+    ma60 = t.get("ma60")
+    if ma60 is not None:
+        if close >= ma60:
+            scenarios.append(f"目前站上季線（MA60 {ma60:,.0f}），中期偏多；若跌破，中期轉弱訊號浮現")
+        else:
+            scenarios.append(f"目前跌破季線（MA60 {ma60:,.0f}），中期偏弱；若站回其上，中期轉強訊號浮現")
+
+    recent_high, recent_low = t.get("recent_high_20d"), t.get("recent_low_20d")
+    if recent_high is not None and recent_low is not None:
+        scenarios.append(
+            f"近20日區間 {recent_low:,.0f}～{recent_high:,.0f}點："
+            f"若突破 {recent_high:,.0f} 多方氣勢可能延續，若跌破 {recent_low:,.0f} 賣壓可能加重"
+        )
+
+    boll_upper, boll_lower = t.get("boll_upper"), t.get("boll_lower")
+    if boll_upper is not None and boll_lower is not None:
+        scenarios.append(
+            f"布林通道 {boll_lower:,.0f}～{boll_upper:,.0f}點："
+            f"站上上緣易現過熱拉回，跌破下緣則可能出現超跌反彈"
+        )
+
+    rsi = t.get("rsi")
+    if rsi is not None:
+        if 65 <= rsi < 70:
+            scenarios.append(f"RSI（{rsi:.0f}）已接近超買（70），留意過熱拉回風險")
+        elif 30 < rsi <= 35:
+            scenarios.append(f"RSI（{rsi:.0f}）已接近超賣（30），留意止跌反彈機會")
+
+    k, d, kd_cross = t.get("k"), t.get("d"), t.get("kd_cross")
+    if k is not None and d is not None and kd_cross is None:
+        diff = k - d
+        if 0 < diff <= 5:
+            scenarios.append(f"K值（{k:.0f}）僅略高於D值（{d:.0f}），留意是否即將翻轉為死亡交叉")
+        elif -5 <= diff < 0:
+            scenarios.append(f"K值（{k:.0f}）僅略低於D值（{d:.0f}），留意是否即將翻轉為黃金交叉")
+
+    return scenarios
+
+
 # ─────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────
@@ -199,7 +273,10 @@ def fetch_taiex() -> dict:
         "ma5_20_cross": None,
         "ma20_60_cross": None,
         "ma_alignment": None,
+        "recent_high_20d": None,
+        "recent_low_20d": None,
         "narrative": None,
+        "scenarios": [],
         "error": None,
     }
 
@@ -252,7 +329,10 @@ def fetch_taiex() -> dict:
         result["ma20_60_cross"] = _cross_event(ma20, ma60)
         result["ma_alignment"] = _ma_alignment(ma5.iloc[-1], ma20.iloc[-1], ma60.iloc[-1])
 
+        result["recent_high_20d"], result["recent_low_20d"] = _recent_high_low(high, low, 20)
+
         result["narrative"] = _build_narrative(result)
+        result["scenarios"] = _build_scenarios(result)
 
         logger.info("TAIEX fetched OK: date=%s close=%s", result["date"], result["close"])
 

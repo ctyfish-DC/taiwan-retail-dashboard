@@ -84,9 +84,16 @@ def build_message(t: dict) -> str:
         lines.append(t["narrative"])
         lines.append("")
 
+    scenarios = t.get("scenarios") or []
+    if scenarios:
+        lines.append("【情境觀察】（非預測，僅供參考）")
+        for s in scenarios:
+            lines.append(f"· {s}")
+        lines.append("")
+
     lines.append("─────────────────")
     lines.append("資料來源: Yahoo Finance (^TWII)")
-    lines.append("⚠️ 僅為技術面數據整理，非投資建議")
+    lines.append("⚠️ 僅為技術面數據整理與條件式情境說明，非投資建議、非價格預測")
 
     return "\n".join(lines)
 
