@@ -1,10 +1,10 @@
 name: TAIEX Daily Technical Analysis LINE Notify
 
 on:
-  schedule:
-    # 每個交易日 15:00 台灣時間（UTC+8）= 07:00 UTC，台股 13:30 收盤後留緩衝
-    # 週一 ~ 週五固定執行；國定假日當天沒有新收盤價，會顯示上一個交易日的資料
-    - cron: "0 7 * * 1-5"
+  # 排程已暫停（大盤更新停止發布）。保留 workflow_dispatch 可手動觸發測試。
+  # 原排程：每個交易日 15:00 台灣時間（UTC+8）= 07:00 UTC
+  # schedule:
+  #   - cron: "0 7 * * 1-5"
   workflow_dispatch:
 
 env:
